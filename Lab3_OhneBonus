@@ -1,0 +1,189 @@
+#include <xc.h>
+
+// Frecuencia del oscilador para los delays
+#define _XTAL_FREQ 4000000
+
+// Bits de Configuración (Fuses originales)
+#pragma config FOSC = HS      // Oscilador de alta velocidad (Cristal de 4MHz)
+#pragma config PBADEN = OFF   // Pines del Puerto B como digitales al resetear
+#pragma config WDT = OFF      // Watchdog Timer desactivado
+#pragma config LVP = OFF      // Programación de bajo voltaje desactivada
+
+// Variables Globales Volátiles
+volatile unsigned char counter = 0;       // Contador BCD (0-9)
+volatile unsigned char tens = 0;          // Control de secuencia del RGB
+volatile unsigned char pulse_detected = 0; // Bandera de software para INT1 (Conteo)
+volatile unsigned char reset_detected = 0; // Bandera de software para INT2 (Reset)
+
+// Prototipos de Funciones
+void setRGB(void);
+
+// =============================================================================
+// INTERRUPCIÓN DE ALTA PRIORIDAD
+// =============================================================================
+void __interrupt(high_priority) High_ISR(void) {
+    
+    // INT0: Parada de Emergencia
+    if (INT0IF == 1) {
+        INT0IF = 0;         // Asignación limpia del flag
+        LATE = 0b0110;      // LED RGB en color ROJO fijo (Ánodo común)
+        
+        while (1) {
+            // Bucle infinito de bloqueo total. Exige reset físico del PIC.
+        }
+    }
+    
+    // Timer0: LED de operación a 1 Hz (0.5s ON / 0.5s OFF)
+    if (TMR0IF == 1) {
+        TMR0IF = 0;
+        TMR0 = 34286;       // Recarga para temporización exacta a 4MHz
+        LATC1 = LATC1 ^ 1;  // Conmuta el estado del LED
+    }
+}
+
+// =============================================================================
+// INTERRUPCIÓN DE BAJA PRIORIDAD
+// =============================================================================
+void __interrupt(low_priority) Low_ISR(void) {
+    
+    // INT1: Pulsador o Sensor de Conteo
+    if (INT1IF == 1) {
+        INT1IF = 0;          // Limpieza inmediata para mitigar ruido eléctrico de la laptop
+        pulse_detected = 1;  // Notifica al main
+    }
+    
+    // INT2: Pulsador de Reset manual
+    if (INT2IF == 1) {
+        INT2IF = 0;          // Limpieza inmediata
+        reset_detected = 1;  // Notifica al main
+    }
+}
+
+// =============================================================================
+// FUNCIÓN PRINCIPAL
+// =============================================================================
+void main(void) {
+    // Configuración de Prioridad de Interrupciones
+    RCONbits.IPEN = 1;  // Habilitar prioridades
+    INTCONbits.GIEH = 1; // Habilitar interrupciones de alta prioridad
+    INTCONbits.GIEL = 1; // Habilitar interrupciones de baja prioridad
+
+    // Configuración del Puerto B (Entradas de interrupción externa)
+    // RB0 = INT0, RB1 = INT1, RB2 = INT2
+    TRISB = 0b00000111; 
+
+    // Configuración INT0 (Alta Prioridad por defecto)
+    INT0IF = 0;
+    INT0IE = 1;
+    INTEDG0 = 0; // Disparo por flanco de bajada
+
+    // Configuración INT1 (Baja Prioridad)
+    INT1IF = 0;
+    INT1IE = 1;
+    INT1IP = 0;  // Asigna baja prioridad
+    INTEDG1 = 1; // Disparo por flanco de subida (Pulso positivo)
+
+    // Configuración INT2 (Baja Prioridad)
+    INT2IF = 0;
+    INT2IE = 1;
+    INT2IP = 0;  // Asigna baja prioridad
+    INTEDG2 = 0; // Disparo por flanco de bajada
+
+    // Configuración de Timer0 (Modo 16 bits, Prescaler 16x)
+    T0CON = 0b00000011; 
+    TMR0 = 34286;       // Carga inicial para 1Hz
+    TMR0IF = 0;
+    TMR0IE = 1;
+    TMR0IP = 1;         // Alta prioridad para el LED indicador
+    TMR0ON = 1;         // Encender Timer0
+
+    // Configuración de Salidas
+    TRISD = 0x00;       // Puerto D como salida para el decodificador BCD
+    TRISE = 0b1000;     // RE0, RE1, RE2 como salidas para el LED RGB
+    TRISC1 = 0;         // RC1 como salida para el LED de estado
+    
+    // Estado inicial del sistema
+    LATD = 0x00;        // Mostrar 0 en el display al arrancar
+    setRGB();           // Inicia el RGB en Negro (Apagado)
+    
+    __delay_ms(200);    // Estabilización inicial de voltaje
+
+    while (1) {
+        // Actualiza el puerto D con el valor actual del contador continuamente
+        LATD = counter; 
+
+        // --- PROCESAR PULSO DE CONTEO (INT1) ---
+        if (pulse_detected == 1) {
+            __delay_ms(40); // Antirrebote inicial: Filtra los micro-picos de ruido del USB
+            
+            // Si el pin sigue en estado alto tras el delay, es un pulso real
+            if (PORTBbits.RB1 == 1) { 
+                counter++;
+                if (counter >= 10) {
+                    counter = 0; // Conteo cíclico 0-9
+                    tens++;      // Avanzar al siguiente color
+                    
+                    // Si pasa de Blanco (6), vuelve a iniciar en Magenta (1)
+                    if (tens > 6) {
+                        tens = 1; 
+                    }
+                    setRGB(); 
+                }
+                __delay_ms(160); // Completa la ventana de inmunidad (200ms en total)
+            }
+            pulse_detected = 0; // Libera la bandera de software
+        }
+
+        // --- PROCESAR RESET DE CUENTA (INT2) ---
+        if (reset_detected == 1) {
+            __delay_ms(40); // Filtro contra ruido eléctrico
+            
+            counter = 0;    // Resetea el contador a 0
+            tens = 0;       // Devuelve el color RGB a Negro
+            setRGB();
+            
+            __delay_ms(160); 
+            reset_detected = 0; // Libera la bandera de software
+        }
+    }
+}
+
+// =============================================================================
+// CONTROL DEL LED RGB (Ánodo Común: 0 = Encendido, 1 = Apagado)
+// =============================================================================
+void setRGB(void) {
+    // RE0 = Rojo, RE1 = Verde, RE2 = Azul
+    switch (tens) {
+        case 0: // NEGRO (Todo apagado)
+            LATE = 0b0111;
+            break;
+
+        case 1: // MAGENTA (Rojo + Azul)
+            LATE = 0b0010;
+            break;
+
+        case 2: // AZUL
+            LATE = 0b0011;
+            break;
+
+        case 3: // CYAN (Verde + Azul)
+            LATE = 0b0001;
+            break;
+
+        case 4: // VERDE
+            LATE = 0b0101;
+            break;
+
+        case 5: // AMARILLO (Rojo + Verde)
+            LATE = 0b0100;
+            break;
+
+        case 6: // BLANCO (Todos encendidos)
+            LATE = 0b0000;
+            break;
+
+        default:
+            LATE = 0b0111; // Por seguridad, Negro
+            break;
+    }
+}
