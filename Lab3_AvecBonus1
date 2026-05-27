@@ -1,0 +1,245 @@
+#include <xc.h>
+#define _XTAL_FREQ 4000000
+#pragma config FOSC=HS
+#pragma config PBADEN=OFF
+#pragma config WDT=OFF
+#pragma config LVP=OFF
+
+
+//Add volatile? 
+volatile char counter = 0;
+volatile char tens = 0;
+volatile bit ringRing = 0;
+volatile bit rangRang = 0;
+volatile bit boton_presionado = 0;
+
+void buzz(unsigned char); //most efficient since bit can't be used as data type for parameters
+void setRGB(void);
+void interrupt ISR(void);
+void interrupt low_priority ISR2(void);
+
+void main(void) {
+    PEIE = 1;
+    GIE = 1;
+    IPEN = 1;
+    //INT0 = Emergency stop
+    //INT1 = Pulsador/Sensor
+    //INT2 = Reset de counter 
+    //External Interrupts config
+    TRISB = 0b00000111;
+    //INT0
+    INT0IF = 0;
+    INT0IE = 1;
+    INTEDG0 = 0;
+
+    //INT1
+    INT1IF = 0;
+    INT1IE = 1; //Cuando un pulso positivo es detectado
+    INT1IP = 0;
+    INTEDG1 = 0;
+
+    //INT2
+    INT2IF = 0;
+    INT2IE = 1;
+    INT2IP = 0;
+    INTEDG2 = 0;
+
+    //Timer0 0.5Hz Led config
+    //4MHz means 1 us per per increase
+    //1_000_000 / 16(16x prescaler) = 62500
+    //start_0.5Hz = 65536 -62500 = 3036 
+    //for real 1 Hz just start1Hz = 65536 -31250 = 34286
+
+    TMR0 = 34286; //34286 for 1Hz with a 16x prescaler
+    T0CON = 0b00000011;
+    TMR0IF = 0;
+    TMR0IE = 1;
+    TMR0IP = 1;
+    TMR0ON = 1;
+
+    //outBCD Config D0 to D3 for BCD
+    TRISD = 0;
+
+    //RGB Registers
+    TRISE = 0b1000;
+    LATE = 0b0111;
+
+
+    //LED config 
+    TRISC = 0;
+
+    //Buzzer pin config
+
+    //TRISC5 = 0;
+    LATC = 0b00000000;
+
+    LATB3 = 0;
+    // blue = RE2
+    // green = RE1
+    // red = RE0
+
+
+    __delay_ms(200);
+
+    while (1) {
+        //LATD = 0b00001000;
+        //LATC1 = LATC1 ^ 1;
+        LATD = counter;
+
+
+
+
+
+        if (boton_presionado == 1) {
+            __delay_ms(50); // Espera un tiempo generoso para que pase TODO el ruido mecánico
+
+            // Verificamos el pin físico (RB1). 
+            // Si tu lógica es de pulso negativo (presionado = 0v), usa: == 0
+            // Si tu lógica es de pulso positivo (presionado = 5v), usa: == 1
+            if (PORTBbits.RB1 == 0) {
+                counter++;
+                if (counter >= 10) {
+                    counter = 0;
+                    tens++;
+                    setRGB();
+                    ringRing = 1; // Activa el buzzer
+                }
+                LATD = counter; // Actualiza el BCD de inmediato
+
+                // ESPERA HASTA QUE SUELTES EL BOTÓN
+                // Esto evita que el contador se vuelva loco si dejas el dedo puesto
+                while (PORTBbits.RB1 == 0) {
+                    __delay_ms(10);
+                }
+                __delay_ms(50); // Antirrebote al soltar el botón
+            }
+
+            // Una vez que el botón se soltó y no hay ruido:
+            boton_presionado = 0; // Limpiamos la bandera de software
+            INT1IF = 0; // Limpiamos cualquier rebote atrapado en el hardware
+            INT1IE = 1;           // Volvemos a habilitar la interrupción para el siguiente click
+        }
+
+
+
+        if (rangRang) {
+            buzz(0);
+            rangRang = 0; // Clear the flag
+            ringRing = 0;
+        } else if (ringRing) {
+            buzz(1);
+            ringRing = 0;
+        }
+
+        __delay_ms(100);
+        //        counter++;
+        //        if(counter >= 10){
+        //            counter =0;
+        //        }
+
+
+    }
+}
+
+//High priority [LED 1Hz && Emergency Stop]
+
+void interrupt ISR(void) {
+
+
+    if (INT0IF == 1) {
+        __delay_ms(200);
+        LATE = 0b0110;
+
+
+
+        LATC1 = LATC1^1;
+        while (1) {
+        }
+
+    }
+    //Led 0.5Hz freq, 1 sec ON, 1 sec OFF
+    if (TMR0IF == 1) {
+        TMR0IF = 0;
+        TMR0 = 34286; //34286 for 1Hz with a 16x prescaler
+        LATC1 = LATC1^1;
+    }
+
+
+
+}
+
+void interrupt low_priority ISR2(void) {
+    //Pulsador/Sensor 
+    if (INT1IF == 1) {
+        boton_presionado = 1; // Avisa al main que hubo un pulso
+        INT1IE = 0; // DESACTIVA temporalmente esta interrupción para ignorar rebotes
+        INT1IF = 0; // Limpia la bandera
+    }
+    //ResetCounter&&Tens
+    if (INT2IF == 1) {
+        counter = 0;
+        tens = 0;
+        setRGB();
+        //LATC1= LATC1^1;
+        __delay_ms(200);
+        INT2IF = 0;
+    }
+
+
+}
+
+void buzz(unsigned char tenOr60) {// ten = 1 sixty = 0
+    LATB3 = 1; // Enciende el buzzer
+    if (tenOr60) {
+        __delay_ms(300);
+    } else {
+        __delay_ms(1500);
+    }
+    LATB3 = 0; // Apaga el buzzer
+
+}
+
+void setRGB() {
+
+    // blue = RE2
+    // green = RE1
+    // red = RE0
+
+
+    // Ánodo común: 0 = ENCENDIDO, 1 = APAGADO
+
+    switch (tens) {
+        case 0: // NEGRO 
+            LATE = 0b0111;
+            break;
+
+        case 1: // MAGENTA 
+            LATE = 0b0010;
+            break;
+
+        case 2: // AZUL 
+            LATE = 0b0011;
+            break;
+
+        case 3: // CYAN 
+            LATE = 0b0001;
+            break;
+
+        case 4: // VERDE 
+            LATE = 0b0101;
+            break;
+
+        case 5: // AMARILLO 
+            LATE = 0b0100;
+            break;
+
+        case 6: // BLANCO 
+            LATE = 0b0000;
+            rangRang = 1;
+            break;
+
+        default: // Si 'tens' vale otra cosa, Negro
+            LATE = 0b0111;
+            break;
+    }
+}
