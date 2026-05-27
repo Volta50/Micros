@@ -1,0 +1,185 @@
+#include <xc.h>
+#define _XTAL_FREQ 4000000
+#pragma config FOSC=HS
+#pragma config PBADEN=OFF
+#pragma config WDT=OFF
+#pragma config LVP=OFF
+
+// Variables globales
+volatile char counter = 0;
+volatile char tens = 0;
+volatile bit ringRing = 0;
+volatile bit rangRang = 0;
+
+// Variable dinámica para el valor de recarga de Timer0
+// 3036 para conmutación de 1s (65536 - 62500)
+// 49911 para conmutación de 250ms (65536 - 15625)
+volatile unsigned int tmr0_reload = 3036; 
+
+void buzz(unsigned char); 
+void setRGB(void);
+void interrupt ISR(void);
+void interrupt low_priority ISR2(void);
+
+void main(void) {
+    PEIE = 1;
+    GIE = 1;
+    IPEN = 1;
+    
+    // External Interrupts config
+    TRISB = 0b00000111;
+    // INT0
+    INT0IF = 0;
+    INT0IE = 1;
+    INTEDG0 = 0;
+
+    // INT1
+    INT1IF = 0;
+    INT1IE = 1; 
+    INT1IP = 0;
+    INTEDG1 = 0;
+
+    // INT2
+    INT2IF = 0;
+    INT2IE = 1;
+    INT2IP = 0;
+    INTEDG2 = 0;
+
+    // Timer0 Config (Prescaler 1:16)
+    TMR0 = tmr0_reload; 
+    T0CON = 0b00000011;
+    TMR0IF = 0;
+    TMR0IE = 1;
+    TMR0IP = 1;
+    TMR0ON = 1;
+
+    // Configuración del Módulo HLVD para ~4V (HLVDL = 1011)
+    HLVDCON = 0b00001011;     // VDIRMAG = 0 (Detectar caída), HLVDL = 1011
+    HLVDCONbits.HLVDEN = 1;   // Activar el módulo HLVD
+    while(!HLVDCONbits.IRVST);// Esperar a que la referencia interna se estabilice
+    PIR2bits.HLVDIF = 0;      // Limpiar bandera de interrupción HLVD
+    PIE2bits.HLVDIE = 1;      // Habilitar interrupción de HLVD
+    IPR2bits.HLVDIP = 1;      // Asignar alta prioridad
+
+    // outBCD Config D0 to D3 for BCD
+    TRISD = 0;
+
+    // RGB Registers
+    TRISE = 0b1000;
+    LATE = 0b0111;
+
+    // LED y Buzzer config 
+    TRISC = 0;
+    LATC = 0b00000000;
+    LATB3 = 0;
+
+    __delay_ms(200);
+
+    while (1) {
+        LATD = counter;
+        
+        if (rangRang) {
+            buzz(0);
+            rangRang = 0; 
+            ringRing = 0;
+        } else if (ringRing) {
+            buzz(1);
+            ringRing = 0;
+        }
+
+        __delay_ms(100);
+    }
+}
+
+// Interrupción de Alta Prioridad
+void interrupt ISR(void) {
+    // Parada de Emergencia (INT0)
+    if (INT0IF == 1) {
+        __delay_ms(200);
+        LATE = 0b0110;
+        LATC1 = LATC1 ^ 1;
+        while (1) {}
+    }
+    
+    // Conmutación del LED mediante Timer0
+    if (TMR0IF == 1) {
+        TMR0IF = 0;
+        TMR0 = tmr0_reload;   // Carga el tiempo dinámico de forma estable
+        LATC1 = LATC1 ^ 1;    // Conmutación del LED en RC1
+    }
+
+    // Interrupción por detección de Voltaje (HLVD)
+    if (PIR2bits.HLVDIF == 1) {
+        PIE2bits.HLVDIE = 0;  // 1. Apagar la interrupción HLVD antes de hacer cambios
+        
+        if (HLVDCONbits.VDIRMAG == 0) {
+            // EL VOLTAJE BAJÓ DE 4V
+            tmr0_reload = 49911;       // Cambiar conmutación a 250 ms
+            LATB3 = 1;                 // Encender Buzzer
+            HLVDCONbits.VDIRMAG = 1;   // Cambiar dirección a detectar subida (> 4V)
+        } else {
+            // EL VOLTAJE VOLVIÓ A SUBIR
+            tmr0_reload = 3036;        // Restaurar conmutación a 1 s
+            LATB3 = 0;                 // Apagar Buzzer
+            HLVDCONbits.VDIRMAG = 0;   // Cambiar dirección a detectar caída (< 4V)
+        }
+        
+        while(!HLVDCONbits.IRVST);     // 2. OBLIGATORIO: Esperar a que el regulador se estabilice
+        PIR2bits.HLVDIF = 0;          // 3. Limpiar la bandera (elimina el falso disparo del cambio de VDIRMAG)
+        PIE2bits.HLVDIE = 1;          // 4. Volver a encender la interrupción de forma segura
+    }
+}
+
+// Interrupción de Baja Prioridad
+void interrupt low_priority ISR2(void) {
+    // Pulsador/Sensor 
+    if (INT1IF == 1) {
+        __delay_ms(30);
+        counter++;
+        if (counter >= 10) {
+            counter = 0;
+            tens++;
+            LATD = counter;
+            setRGB();
+            ringRing = 1;
+        }
+        LATD = counter;
+        __delay_ms(20);
+        INT1IF = 0;
+    }
+    
+    // Reset Counter & Tens
+    if (INT2IF == 1) {
+        counter = 0;
+        tens = 0;
+        setRGB();
+        __delay_ms(200);
+        INT2IF = 0;
+    }
+}
+
+void buzz(unsigned char tenOr60) {
+    LATB3 = 1; 
+    if (tenOr60) {
+        __delay_ms(300);
+    } else {
+        __delay_ms(1500);
+    }
+    LATB3 = 0; 
+}
+
+void setRGB() {
+    switch (tens) {
+        case 0: LATE = 0b0111; break;
+        case 1: LATE = 0b0010; break;
+        case 2: LATE = 0b0011; break;
+        case 3: LATE = 0b0001; break;
+        case 4: LATE = 0b0101; break;
+        case 5: LATE = 0b0100; break;
+        case 6: 
+            LATE = 0b0000;
+            rangRang = 1;
+            break;
+        default: LATE = 0b0111; break;
+    }
+}
