@@ -1,0 +1,239 @@
+#include <xc.h>
+
+#define _XTAL_FREQ 1000000
+
+#define RS    LATA5
+#define E     LATA4
+#include "LibLCDXC8.h"
+
+#pragma config FOSC = INTOSC_EC
+#pragma config WDT = OFF
+#pragma config PBADEN = OFF
+#pragma config LVP = OFF
+
+unsigned char Tecla        = 0;
+unsigned char TeclaLista   = 0;
+unsigned char counter      = 0; // Piezas contadas por sensor
+
+void interrupt ISR(void);
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas);
+
+void main(void) {
+    unsigned char i;
+    unsigned char digitoBuf[2]   = {0xFF, 0xFF};
+    unsigned char numDigitos      = 0;
+    unsigned char cuentaObjetivo  = 0;
+    unsigned char valorTemporal;
+    unsigned char faltantes;
+
+    OSCCON = 0b01000100;
+
+    ADCON1 = 0x0F;
+    TRISA4 = 0; TRISA5 = 0;
+    LATA4  = 0; LATA5  = 0;
+    TRISD  = 0; LATD   = 0;
+
+    __delay_ms(1000);
+    ConfiguraLCD(4);
+    InicializaLCD();
+
+    // ── Mensaje 1 ──────────────────────────────────────────────────────
+    EscribeLCD_c('U'); EscribeLCD_c('n'); EscribeLCD_c(' ');
+    EscribeLCD_c('d'); EscribeLCD_c('i'); EscribeLCD_c('a');
+    EscribeLCD_c(' '); EscribeLCD_c('m'); EscribeLCD_c('a');
+    EscribeLCD_c('s');
+
+    DireccionaLCD(0xC0);
+    EscribeLCD_c(' '); EscribeLCD_c(' ');
+    EscribeLCD_c(' '); EscribeLCD_c(' ');
+    EscribeLCD_c('u'); EscribeLCD_c('n'); EscribeLCD_c(' ');
+    EscribeLCD_c('d'); EscribeLCD_c('i'); EscribeLCD_c('a');
+    EscribeLCD_c(' '); EscribeLCD_c('m'); EscribeLCD_c('e');
+    EscribeLCD_c('n'); EscribeLCD_c('o'); EscribeLCD_c('s');
+
+    __delay_ms(5000);
+
+    // ── Mensaje 2: solicitud cuenta objetivo ───────────────────────────
+    BorraLCD();
+    EscribeLCD_c('D'); EscribeLCD_c('i'); EscribeLCD_c('g');
+    EscribeLCD_c('i'); EscribeLCD_c('t'); EscribeLCD_c('e');
+    EscribeLCD_c(' '); EscribeLCD_c('l'); EscribeLCD_c('a');
+    EscribeLCD_c(' '); EscribeLCD_c('c'); EscribeLCD_c('u');
+    EscribeLCD_c('e'); EscribeLCD_c('n'); EscribeLCD_c('t');
+    EscribeLCD_c('a');
+
+    DireccionaLCD(0xC0);
+    EscribeLCD_c('o'); EscribeLCD_c('b'); EscribeLCD_c('j');
+    EscribeLCD_c('e'); EscribeLCD_c('t'); EscribeLCD_c('i');
+    EscribeLCD_c('v'); EscribeLCD_c('o'); EscribeLCD_c(':');
+    EscribeLCD_c(' '); EscribeLCD_c('_'); EscribeLCD_c('_');
+    // Línea 2: "objetivo: __"
+    // 0xC9=espacio  0xCA=1er_  0xCB=2do_
+
+    // ── Configuración teclado ──────────────────────────────────────────
+    TRISB = 0b11110000;
+    TRISC = 0;
+    LATB  = 0b00000000;
+    LATC  = 0;
+    RBPU  = 0;
+    __delay_ms(100);
+
+    RBIF = 0;
+    RBIE = 1;
+    GIE  = 1;
+
+    // ── Captura número objetivo (1-59) ─────────────────────────────────
+    while (cuentaObjetivo == 0) {
+
+        if (TeclaLista) {
+            TeclaLista = 0;
+            unsigned char t = Tecla;
+
+            if (t == 10) {
+                // ── OK: validar ────────────────────────────────────────
+                if (numDigitos == 1) {
+                    valorTemporal = digitoBuf[0];
+                } else if (numDigitos == 2) {
+                    valorTemporal = digitoBuf[0] * 10 + digitoBuf[1];
+                } else {
+                    valorTemporal = 0;
+                }
+
+                if (valorTemporal >= 1 && valorTemporal <= 59) {
+                    cuentaObjetivo = valorTemporal;
+                    DireccionaLCD(0xCC);
+                    EscribeLCD_c('O'); EscribeLCD_c('K');
+                    __delay_ms(1000);
+
+                } else {
+                    DireccionaLCD(0xCA);
+                    EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('R');
+                    __delay_ms(1500);
+
+                    DireccionaLCD(0xCA);
+                    EscribeLCD_c('_'); EscribeLCD_c('_');
+
+                    numDigitos   = 0;
+                    digitoBuf[0] = 0xFF;
+                    digitoBuf[1] = 0xFF;
+                }
+
+            } else if (t <= 9 && numDigitos < 2) {
+                digitoBuf[numDigitos] = t;
+                numDigitos++;
+                DireccionaLCD(0xC9 + numDigitos);
+                EscribeLCD_c('0' + t);
+            }
+        }
+    }
+
+    // ── Mensaje 3: pantalla de conteo ──────────────────────────────────
+    // Línea 1: "Piezas falt: __"   (posición 0x8D=1er dígito, 0x8E=2do)
+    // Línea 2: "Cuenta obj.: __"   (posición 0xCD=1er dígito, 0xCE=2do)
+    //
+    // Mapa línea 1 (0x80-0x8F):
+    // P i e z a s   f a l t :     _  _
+    // 0 1 2 3 4 5 6 7 8 9 A B  C  D  E
+    //
+    // Mapa línea 2 (0xC0-0xCF):
+    // C u e n t a   o b j . :     _  _
+    // 0 1 2 3 4 5 6 7 8 9 A B  C  D  E
+
+    BorraLCD();
+
+    // Línea 1: "Piezas falt: __"
+    DireccionaLCD(0x80);
+    EscribeLCD_c('P'); EscribeLCD_c('i'); EscribeLCD_c('e');
+    EscribeLCD_c('z'); EscribeLCD_c('a'); EscribeLCD_c('s');
+    EscribeLCD_c(' '); EscribeLCD_c('f'); EscribeLCD_c('a');
+    EscribeLCD_c('l'); EscribeLCD_c('t'); EscribeLCD_c(':');
+    EscribeLCD_c(' '); EscribeLCD_c('_'); EscribeLCD_c('_');
+
+    // Línea 2: "Cuenta obj.: __"
+    DireccionaLCD(0xC0);
+    EscribeLCD_c('C'); EscribeLCD_c('u'); EscribeLCD_c('e');
+    EscribeLCD_c('n'); EscribeLCD_c('t'); EscribeLCD_c('a');
+    EscribeLCD_c(' '); EscribeLCD_c('o'); EscribeLCD_c('b');
+    EscribeLCD_c('j'); EscribeLCD_c('.'); EscribeLCD_c(':');
+    EscribeLCD_c(' ');
+
+    // Escribir cuenta objetivo fija (no cambia)
+    if (cuentaObjetivo >= 10) {
+        EscribeLCD_c('0' + (cuentaObjetivo / 10));
+        EscribeLCD_c('0' + (cuentaObjetivo % 10));
+    } else {
+        EscribeLCD_c(' ');
+        EscribeLCD_c('0' + cuentaObjetivo);
+    }
+
+    // ── Bucle principal de conteo ──────────────────────────────────────
+    unsigned char counterAnterior = 0xFF; // Forzar primera actualización
+
+    while (1) {
+
+        // Solo redibujar faltantes si counter cambió
+        if (counter != counterAnterior) {
+            counterAnterior = counter;
+            ActualizaLCD(cuentaObjetivo, counter);
+        }
+    }
+}
+
+// Actualiza solo los dígitos de "Piezas falt:" en línea 1
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas) {
+    unsigned char faltantes;
+
+    if (contadas >= objetivo) {
+        faltantes = 0;
+    } else {
+        faltantes = objetivo - contadas;
+    }
+
+    DireccionaLCD(0x8D); // Posición dígitos faltantes en línea 1
+    if (faltantes >= 10) {
+        EscribeLCD_c('0' + (faltantes / 10));
+        EscribeLCD_c('0' + (faltantes % 10));
+    } else {
+        EscribeLCD_c(' ');
+        EscribeLCD_c('0' + faltantes);
+    }
+}
+
+// ── ISR ────────────────────────────────────────────────────────────────
+void interrupt ISR(void) {
+    if (RBIF == 1) {
+        if (PORTB != 0b11110000) {
+            Tecla = 0;
+            LATB = 0b11111110;
+            if      (RB4 == 0) Tecla = 13;
+            else if (RB5 == 0) Tecla = 12;
+            else if (RB6 == 0) Tecla = 11;
+            else if (RB7 == 0) Tecla = 10;
+            else {
+                LATB = 0b11111101;
+                if      (RB4 == 0) Tecla = 15;
+                else if (RB5 == 0) Tecla = 9;
+                else if (RB6 == 0) Tecla = 6;
+                else if (RB7 == 0) Tecla = 3;
+                else {
+                    LATB = 0b11111011;
+                    if      (RB4 == 0) Tecla = 0;
+                    else if (RB5 == 0) Tecla = 8;
+                    else if (RB6 == 0) Tecla = 5;
+                    else if (RB7 == 0) Tecla = 2;
+                    else {
+                        LATB = 0b11110111;
+                        if      (RB4 == 0) Tecla = 14;
+                        else if (RB5 == 0) Tecla = 7;
+                        else if (RB6 == 0) Tecla = 4;
+                        else if (RB7 == 0) Tecla = 1;
+                    }
+                }
+            }
+            LATB = 0b00000000;
+            TeclaLista = 1;
+        }
+        __delay_ms(100);
+        RBIF = 0;
+    }
+}
