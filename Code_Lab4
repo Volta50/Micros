@@ -562,7 +562,7 @@ void interrupt ISR(void) {
     if (TMR0IF == 1) {
         TMR0IF = 0;
         TMR0   = tmr0_reload;
-        LATC1  = LATC1 ^ 1;
+        LATA0  = LATA0 ^ 1;
 
         // -- BONUS 2: acumular tiempo de inactividad --------------------------
         //  El reload define el periodo del desbordamiento: 1000 ms en normal,
