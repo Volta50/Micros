@@ -2,6 +2,10 @@
 //  SISTEMA FUSIONADO: Contador con teclado + LCD + BCD + RGB + Buzzer + HLVD
 //  + BONUS: Bienvenida con caracter propio (fantasma flotando), efectos de
 //    desplazamiento derecha/izquierda y cursor apagado. Solo al inicio.
+//  + BONUS 2: Tecla de backlight (ON/OFF), auto-apagado de luz a 10 s de
+//    inactividad y suspension total (SLEEP) a 20 s. La actividad (tecla o
+//    deteccion de pieza) reinicia el temporizador. El conteo de inactividad
+//    arranca al salir de la bienvenida (en el menu de cuenta objetivo).
 //  PIC18F4550
 //  Oscilador: INTERNO 1 MHz
 //    FOSC  = INTOSC_HS       -> RA6 y RA7 libres como I/O
@@ -12,6 +16,7 @@
 //    Conmutacion 250ms -> TMR0 reload = 57724  (65536 -  7812)  [alerta HLVD]
 // =============================================================================
 //  Pines relevantes:
+//    RA1  -> Backlight LCD (BLK, salida activo-alto)
 //    RA2  -> Sensor infrarrojo (polling, flanco de bajada)
 //    RA3  -> Buzzer  (salida activo-alto)
 //    RA4  -> LCD E
@@ -32,6 +37,16 @@
 #define E     LATA4
 #include "LibLCDXC8.h"
 
+// -- Codigo de la tecla que conmuta el backlight ------------------------------
+//  En el barrido del teclado, la tecla fisica que enciende/apaga la luz de
+//  fondo genera el codigo 13. Si tu "tecla 16" produce otro valor, ajustalo
+//  aqui (presiona la tecla y observa que valor toma 'Tecla' en el barrido).
+#define TECLA_BACKLIGHT 13
+
+// -- Umbrales de inactividad (en ms) ------------------------------------------
+#define MS_APAGA_LUZ    10000U   // 10 s -> apaga backlight
+#define MS_SUSPENSION   20000U   // 20 s -> suspension total (SLEEP)
+
 // -- Fuses --------------------------------------------------------------------
 #pragma config FOSC   = INTOSC_HS
 #pragma config WDT    = OFF
@@ -48,13 +63,19 @@ volatile unsigned char ReiniciarConteo = 0;
 volatile unsigned char ringRing        = 0;
 volatile unsigned char rangRang        = 0;
 volatile unsigned char initialized     = 0;
-volatile unsigned int tmr0_reload = 34286;
+
+volatile unsigned int  tmr0_reload     = 34286;
+
+// -- BONUS 2: gestion de inactividad / suspension -----------------------------
+volatile unsigned int  tiempoInactivo  = 0;   // ms acumulados por Timer0
+volatile unsigned char backlightOn     = 1;   // estado DESEADO del BLK (RA1)
+volatile unsigned char enSuspension    = 0;   // 1 mientras el sistema duerme
 
 // =============================================================================
-//  BONUS: Caracteres propios en CGRAM ? fantasma con 2 cuadros de animacion
+//  BONUS: Caracteres propios en CGRAM - fantasma con 2 cuadros de animacion
 // =============================================================================
 
-// Fantasma 5x8 ? cuadro 0: posicion ALTA (flotando arriba)
+// Fantasma 5x8 - cuadro 0: posicion ALTA (flotando arriba)
 const unsigned char fantasmaArriba[8] = {
     0b01110,    //  ###   <- cupula de la cabeza
     0b11111,    // #####
@@ -66,7 +87,7 @@ const unsigned char fantasmaArriba[8] = {
     0b00000     //        <- fila libre (espacio para "bajar")
 };
 
-// Fantasma 5x8 ? cuadro 1: posicion BAJA (bajado 1 pixel, falda alternada)
+// Fantasma 5x8 - cuadro 1: posicion BAJA (bajado 1 pixel, falda alternada)
 const unsigned char fantasmaAbajo[8] = {
     0b00000,    //        <- fila libre (el fantasma bajo)
     0b01110,    //  ###
@@ -83,6 +104,7 @@ void ActualizaLCD(unsigned char objetivo, unsigned char contadas);
 void buzz(unsigned char shortBuzz);
 void setRGB(void);
 void CreaCaracter(unsigned char pos, const unsigned char *mapa);
+void EntrarSuspension(void);
 void interrupt ISR(void);
 
 // =============================================================================
@@ -95,7 +117,7 @@ void main(void) {
     unsigned char valorTemporal;
     unsigned char paso, cuadro = 0;     // BONUS: animacion de bienvenida
 
-    // -- Oscilador interno 1 MHz ? PRIMERO, antes de cualquier delay o IRQ ----
+    // -- Oscilador interno 1 MHz - PRIMERO, antes de cualquier delay o IRQ ----
     OSCCON = 0b01000011;
     while (!OSCCONbits.IOFS);  // Esperar oscilador interno estable
 
@@ -107,10 +129,10 @@ void main(void) {
     // -- Puertos analogicos -> digitales --------------------------------------
     ADCON1 = 0x0F;
 
-    // -- PORTA: LCD (RA4=E, RA5=RS) + buzzer (RA3) ----------------------------
+    // -- PORTA: LCD (RA4=E, RA5=RS) + buzzer (RA3) + backlight (RA1) ----------
     TRISA  = 0;
     LATA   = 0;
-    LATA1 = 1; // Set BLK as 1 at the start
+    LATA1  = 1; // Backlight encendido al arranque
 
     // -- PORTB: teclado matricial ----------------------------------------------
     TRISB = 0b11110000;
@@ -242,6 +264,13 @@ void main(void) {
     LATE            = 0b1111;
     LATD            = 0;
 
+    // -- BONUS 2: arrancar la cuenta de inactividad AQUI (post-bienvenida) -----
+    //  Asi la luz no se apaga ni el sistema se duerme durante los ~5 s de la
+    //  animacion de bienvenida. Tambien aplica al regresar con la tecla 15.
+    tiempoInactivo  = 0;
+    backlightOn     = 1;
+    LATA1           = 1;     // luz encendida al entrar al menu
+
     BorraLCD();
     EscribeLCD_c('D'); EscribeLCD_c('i'); EscribeLCD_c('g');
     EscribeLCD_c('i'); EscribeLCD_c('t'); EscribeLCD_c('e');
@@ -257,6 +286,15 @@ void main(void) {
 
     // -- Captura numero objetivo (1-59) -----------------------------------------
     while (cuentaObjetivo == 0) {
+
+        // -- BONUS 2: gestion de inactividad tambien en el menu objetivo --------
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA1 == 1) {
+            LATA1 = 0;          // apaga backlight (auto), conserva backlightOn
+        }
+
         if (TeclaLista) {
             TeclaLista = 0;
             unsigned char t = Tecla;
@@ -326,8 +364,17 @@ void main(void) {
     // -- Bucle principal de conteo ---------------------------------------------------
     unsigned char counterAnterior = 0xFF;
     unsigned char ra2_prev        = 0;
-    
+
     while (1) {
+
+        // -- BONUS 2: gestion de inactividad en el conteo -----------------------
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+            counterAnterior = 0xFF;     // forzar refresco del numero al volver
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA1 == 1) {
+            LATA1 = 0;          // apaga backlight (auto), conserva backlightOn
+        }
 
         if (FinalizarConteo) {
             goto MENU_OBJETIVO;
@@ -356,6 +403,10 @@ void main(void) {
                 }
 
                 counter++;
+
+                // -- BONUS 2: una pieza es actividad ----------------------------
+                tiempoInactivo = 0;     // reinicia el temporizador de inactividad
+                LATA1 = backlightOn;    // si el auto-off habia apagado la luz, la restaura
 
                 // setRGB() maneja internamente el reset de tens (case 6)
                 // y la activacion de rangRang, igual que el original.
@@ -405,6 +456,40 @@ void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
         EscribeLCD_c(mapa[i]);                      // RS=1: escribe el patron
     }
     DireccionaLCD(0x80);                            // Volver a DDRAM
+}
+
+// =============================================================================
+//  BONUS 2: Suspension total del sistema (SLEEP)
+//  Apaga consumidores visibles (backlight, LED, RGB) SIN borrar el LCD: el
+//  controlador HD44780 conserva el texto en DDRAM mientras haya alimentacion,
+//  por eso al despertar la pantalla reaparece intacta sin redibujar.
+//  Despierta por la interrupcion de cambio en PORTB (teclado), que es
+//  asincrona y por tanto valida como fuente de wake-up en SLEEP.
+//  Nota: HLVDIE queda habilitado, asi que una caida de voltaje tambien
+//  despertaria el sistema. Si solo quieres que el teclado despierte, pon
+//  HLVDIE = 0 antes del SLEEP y restauralo despues.
+// =============================================================================
+void EntrarSuspension(void) {
+    // Apagar lo que consume / es visible
+    LATA1 = 0;          // Backlight OFF
+    LATC  = 0;          // LED indicador OFF
+    LATE  = 0b1111;     // RGB OFF
+
+    // Preparar el despertar por teclado
+    backlightOn  = 1;   // al volver queremos luz
+    enSuspension = 1;
+    RBIF = 0;
+    RBIE = 1;
+    GIE  = 1;
+
+    asm("SLEEP");       // <<< el PIC se duerme aqui
+    asm("NOP");         // se ejecuta al despertar (recomendado tras SLEEP)
+
+    // ---- Continua aqui tras despertar (la ISR de RBIF ya corrio) ----
+    enSuspension   = 0;
+    tiempoInactivo = 0;
+    LATA1          = 1;   // Backlight ON
+    backlightOn    = 1;
 }
 
 // =============================================================================
@@ -467,17 +552,24 @@ void setRGB(void) {
 
 // =============================================================================
 //  ISR DE ALTA PRIORIDAD
-//  - Timer0:  conmutacion del LED en RC1
+//  - Timer0:  conmutacion del LED en RC1 + acumulador de inactividad
 //  - HLVD:    deteccion de voltaje bajo -> ajusta Timer0
-//  - RBIF:    teclado matricial (emergencia, reinicio, menu)
+//  - RBIF:    teclado matricial (emergencia, reinicio, menu, backlight, wake)
 // =============================================================================
 void interrupt ISR(void) {
 
-    // -- Timer0: conmutacion LED RC1 ------------------------------------------
+    // -- Timer0: conmutacion LED RC1 + cuenta de inactividad ------------------
     if (TMR0IF == 1) {
         TMR0IF = 0;
         TMR0   = tmr0_reload;
         LATC1  = LATC1 ^ 1;
+
+        // -- BONUS 2: acumular tiempo de inactividad --------------------------
+        //  El reload define el periodo del desbordamiento: 1000 ms en normal,
+        //  250 ms en modo alerta HLVD. Se suma segun el reload activo.
+        if (tiempoInactivo < 60000) {
+            tiempoInactivo += (tmr0_reload == 57724) ? 250 : 1000;
+        }
     }
 
     // -- HLVD: bajo voltaje ------------------------------------------------------
@@ -529,42 +621,59 @@ void interrupt ISR(void) {
             }
             LATB = 0b00000000;                          // Restaurar columnas
 
-            // -- Tecla 11: parada de emergencia ----------------------------------
-            if (Tecla == 11) {
-                LATE = 0b1110;      // Rojo (RE0=0 enciende rojo)
+            // -- BONUS 2: cualquier tecla = actividad --------------------------
+            tiempoInactivo = 0;
 
-                BorraLCD();
-                DireccionaLCD(0x80);
-                EscribeLCD_c('!'); EscribeLCD_c('!');
-                EscribeLCD_c(' '); EscribeLCD_c('E'); EscribeLCD_c('M');
-                EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('G');
-                EscribeLCD_c('E'); EscribeLCD_c('N'); EscribeLCD_c('C');
-                EscribeLCD_c('I'); EscribeLCD_c('A'); EscribeLCD_c(' ');
-                EscribeLCD_c('!'); EscribeLCD_c('!');
-                DireccionaLCD(0xC0);
-                EscribeLCD_c('S'); EscribeLCD_c('i'); EscribeLCD_c('s');
-                EscribeLCD_c('t'); EscribeLCD_c('e'); EscribeLCD_c('m');
-                EscribeLCD_c('a'); EscribeLCD_c(' '); EscribeLCD_c('d');
-                EscribeLCD_c('e'); EscribeLCD_c('t'); EscribeLCD_c('e');
-                EscribeLCD_c('n'); EscribeLCD_c('i'); EscribeLCD_c('d');
-                EscribeLCD_c('o');
-                while (1) { }       // Bloqueo total: solo sale con MCLR
-            }
-
-            // -- Tecla 14: reiniciar conteo ---------------------------------------
-            if (Tecla == 14) {
-                ReiniciarConteo = 1;
-            }
-            // -- Tecla 15: volver al menu -----------------------------------------
-            else if (Tecla == 15) {
-                FinalizarConteo = 1;
-            }
-            // -- Resto de teclas ---------------------------------------------------
-            else if( Tecla == 13){
-                LATA1 = LATA1 ^ 1;//Toggle BLK               
-                __delay_ms(20);
+            if (enSuspension) {
+                // Esta pulsacion solo sirvio para DESPERTAR del SLEEP.
+                // No ejecuta la accion normal de la tecla (evita disparar
+                // emergencia/reinicio/menu al volver de la suspension).
+                enSuspension = 0;
             } else {
-                TeclaLista = 1;
+
+                // -- Tecla 11: parada de emergencia ----------------------------
+                if (Tecla == 11) {
+                    LATE = 0b1110;      // Rojo (RE0=0 enciende rojo)
+
+                    BorraLCD();
+                    DireccionaLCD(0x80);
+                    EscribeLCD_c('!'); EscribeLCD_c('!');
+                    EscribeLCD_c(' '); EscribeLCD_c('E'); EscribeLCD_c('M');
+                    EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('G');
+                    EscribeLCD_c('E'); EscribeLCD_c('N'); EscribeLCD_c('C');
+                    EscribeLCD_c('I'); EscribeLCD_c('A'); EscribeLCD_c(' ');
+                    EscribeLCD_c('!'); EscribeLCD_c('!');
+                    DireccionaLCD(0xC0);
+                    EscribeLCD_c('S'); EscribeLCD_c('i'); EscribeLCD_c('s');
+                    EscribeLCD_c('t'); EscribeLCD_c('e'); EscribeLCD_c('m');
+                    EscribeLCD_c('a'); EscribeLCD_c(' '); EscribeLCD_c('d');
+                    EscribeLCD_c('e'); EscribeLCD_c('t'); EscribeLCD_c('e');
+                    EscribeLCD_c('n'); EscribeLCD_c('i'); EscribeLCD_c('d');
+                    EscribeLCD_c('o');
+                    while (1) { }       // Bloqueo total: solo sale con MCLR
+                }
+
+                // -- Tecla 14: reiniciar conteo -------------------------------
+                if (Tecla == 14) {
+                    ReiniciarConteo = 1;
+                }
+                // -- Tecla 15: volver al menu ---------------------------------
+                else if (Tecla == 15) {
+                    FinalizarConteo = 1;
+                }
+                // -- Tecla de backlight: conmuta el estado deseado ------------
+                else if (Tecla == TECLA_BACKLIGHT) {
+                    backlightOn ^= 1;
+                }
+                // -- Resto de teclas ------------------------------------------
+                else {
+                    TeclaLista = 1;
+                }
+
+                // Aplica el estado deseado del backlight. Esto tambien
+                // RESTAURA la luz si el auto-off (10 s) la habia apagado:
+                // cualquier tecla devuelve la pantalla a 'backlightOn'.
+                LATA1 = backlightOn;
             }
         }
         __delay_ms(100);
