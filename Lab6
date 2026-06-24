@@ -59,6 +59,8 @@
 #pragma config LVP    = OFF     // Single-Supply ICSP
 #pragma config ICPRT  = OFF     // Dedicated In-Circuit Debug/Programming
 #pragma config XINST  = OFF     // Extended Instruction Set
+#pragma config CCP2MX = ON   // O "PORTC" dependiendo del PIC exacto (ej. PIC18F4550)
+                             // Esto obliga al CCP2 a quedarse en RC1 y libera RB3 para el teclado.
 
 // -- Variables globales (contador) --------------------------------------------
 volatile unsigned char Tecla           = 0;
@@ -725,13 +727,14 @@ void setRGB(void) {
 }
 
 // =============================================================================
-//  ISR DE ALTA PRIORIDAD
+//  ISR DE ALTA PRIORIDAD (CORREGIDA Y ANTI-BLOQUEO)
 // =============================================================================
 void interrupt ISR(void) {
+    // -- Interrupción de Timer0 (1 Hz y Telemetría) ---------------------------
     if (TMR0IF == 1) {
         TMR0IF = 0;
         TMR0   = tmr0_reload;
-        LATA6  = LATA6 ^ 1;     // LED que parpadea cada segundo (RA6)
+        LATA6  = LATA6 ^ 1;     // LED parpadeo
         if (tiempoInactivo < 60000) {
             tiempoInactivo += (tmr0_reload == 57724) ? 250 : 1000;
         }
@@ -739,6 +742,7 @@ void interrupt ISR(void) {
         if (acumADC >= 1000) { acumADC = 0; flagADC = 1; }
     }
 
+    // -- Interrupción de HLVD (Falla de energía) ------------------------------
     if (HLVDIF == 1) {
         HLVDIE = 0;
         if (VDIRMAG == 0) { tmr0_reload = 57724; VDIRMAG = 1; }
@@ -747,56 +751,95 @@ void interrupt ISR(void) {
         HLVDIF = 0; HLVDIE = 1;
     }
 
+    // -- Interrupción de UART RX (Comandos seriales) --------------------------
     if (PIR1bits.RCIF == 1) {
         if (RCSTAbits.OERR) { RCSTAbits.CREN = 0; RCSTAbits.CREN = 1; }
         unsigned char c = RCREG;
         tiempoInactivo = 0;
         if (LATA2 == 0 && !enSuspension) LATA2 = backlightOn;
-        comandoPendiente = c; // Solo guardamos el comando, no ejecutamos aquí
+        ProcesaComando(c);
     }
 
+    // -- Interrupción de PORTB (Teclado Matricial) ----------------------------
     if (RBIF == 1) {
-        if (PORTB != 0b11110000) {
-            Tecla = 0;
+        // 1. Lectura inicial obligatoria para capturar el estado y romper el mismatch
+        unsigned char portb_registro = PORTB; 
+
+        // Solo escaneamos si realmente hay alguna fila en BAJO (tecla presionada)
+        if ((portb_registro & 0xF0) != 0xF0) {
+            
+            __delay_ms(5); // Antirrebote rápido de entrada
+            Tecla = 255;   // Valor por defecto (ninguna tecla válida)
+
+            // --- ESCANEO COLUMNA 0 (RB0) ---
             LATB = 0b11111110;
+            __delay_us(10); // Tiempo de asentamiento eléctrico
             if      (PORTBbits.RB4 == 0) Tecla = 13;
             else if (PORTBbits.RB5 == 0) Tecla = 12;
             else if (PORTBbits.RB6 == 0) Tecla = 11;
             else if (PORTBbits.RB7 == 0) Tecla = 10;
-            else {
+
+            // --- ESCANEO COLUMNA 1 (RB1) ---
+            if (Tecla == 255) {
                 LATB = 0b11111101;
+                __delay_us(10);
                 if      (PORTBbits.RB4 == 0) Tecla = 15;
                 else if (PORTBbits.RB5 == 0) Tecla = 9;
                 else if (PORTBbits.RB6 == 0) Tecla = 6;
                 else if (PORTBbits.RB7 == 0) Tecla = 3;
-                else {
-                    LATB = 0b11111011;
-                    if      (PORTBbits.RB4 == 0) Tecla = 0;
-                    else if (PORTBbits.RB5 == 0) Tecla = 8;
-                    else if (PORTBbits.RB6 == 0) Tecla = 5;
-                    else if (PORTBbits.RB7 == 0) Tecla = 2;
-                    else {
-                        LATB = 0b11110111;
-                        if      (PORTBbits.RB4 == 0) Tecla = 14;
-                        else if (PORTBbits.RB5 == 0) Tecla = 7;
-                        else if (PORTBbits.RB6 == 0) Tecla = 4;
-                        else if (PORTBbits.RB7 == 0) Tecla = 1;
+            }
+
+            // --- ESCANEO COLUMNA 2 (RB2) ---
+            if (Tecla == 255) {
+                LATB = 0b11111011;
+                __delay_us(10);
+                if      (PORTBbits.RB4 == 0) Tecla = 0;
+                else if (PORTBbits.RB5 == 0) Tecla = 8;
+                else if (PORTBbits.RB6 == 0) Tecla = 5;
+                else if (PORTBbits.RB7 == 0) Tecla = 2;
+            }
+
+            // --- ESCANEO COLUMNA 3 (RB3) (Ahora libre gracias al CCP2MX) ---
+            if (Tecla == 255) {
+                LATB = 0b11110111;
+                __delay_us(10);
+                if      (PORTBbits.RB4 == 0) Tecla = 14;
+                else if (PORTBbits.RB5 == 0) Tecla = 7;
+                else if (PORTBbits.RB6 == 0) Tecla = 4;
+                else if (PORTBbits.RB7 == 0) Tecla = 1;
+            }
+
+            // 2. RESTAURAR COLUMNAS A 0 (Es vital para volver a detectar cambios)
+            LATB = 0b00000000; 
+            tiempoInactivo = 0;
+
+            // 3. Procesar la tecla detectada
+            if (Tecla != 255) {
+                if (enSuspension) { 
+                    enSuspension = 0; 
+                } else {
+                    if (Tecla == 11) {
+                        if (!enEmergencia) { 
+                            enEmergencia = 1; 
+                            enConteo = 0; 
+                            CCPR1L = 0;       // Apaga el PWM inmediatamente en hardware
+                            CCP1CON = 0;
+                            LATE = 0b1110;    // LED de Emergencia
+                        }
                     }
+                    else if (Tecla == 14) { ReiniciarConteo = 1; }
+                    else if (Tecla == 15) { FinalizarConteo = 1; }
+                    else if (Tecla == TECLA_BACKLIGHT) { backlightOn ^= 1; }
+                    else { TeclaLista = 1; }
+                    LATA2 = backlightOn;
                 }
             }
-            LATB = 0b00000000;
-            TeclaLista = 1;
-            tiempoInactivo = 0;
-            if (LATA2 == 0 && !enSuspension) LATA2 = backlightOn;
-            
-            if (Tecla == TECLA_BACKLIGHT) {
-                backlightOn ^= 1;
-                LATA2 = backlightOn;
-                TeclaLista = 0;
-            }
         }
-        unsigned char portb_read = PORTB;
-        RBIF = 0;
+
+        // 4. LIMPIEZA ABSOLUTA DEL MISMATCH (Evita el bucle infinito)
+        __delay_ms(20);          // Espera prudente para estabilidad
+        portb_registro = PORTB;  // Lectura final obligatoria de PORTB con columnas en 0
+        RBIF = 0;                // Borramos el flag de interrupción de forma segura
     }
 }
 
