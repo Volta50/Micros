@@ -1,0 +1,188 @@
+/* ============================================================
+ * Proyecto: PIC18F4550 - Control de motor por umbral de ADC
+ * Fosc = 1 MHz (oscilador interno)
+ * BaudRate = 9600 bps (HC-05)
+ *
+ * Funcionalidad:
+ *  1) Al arrancar, muestra en el LCD la causa del reset anterior:
+ *     "Falla de energia" (POR) o "Reset de usuario" (MCLR).
+ *     Las demas fuentes de reset (BOR, WDT, Stack) estan desactivadas.
+ *  2) Lee un potenciometro de 1k en AN1 (RA1) a una frecuencia de 1 Hz.
+ *  3) Si el valor analogo es mayor a 2.5 V (ADC > 511) -> motor ON
+ *     Si es menor -> motor OFF.
+ *     El motor se controla con un transistor en RC0.
+ *  4) Muestra el valor del ADC y el estado del motor en el LCD,
+ *     y lo envia por Bluetooth (HC-05).
+ * ============================================================ */
+
+#include <xc.h>
+#define _XTAL_FREQ 1000000
+
+/* Pines del LCD (definir ANTES de incluir la libreria) */
+#define RS    LATA5
+#define E     LATA4
+#include "LibLCDXC8.h"
+
+/* ---- Bits de configuracion ---- */
+#pragma config FOSC   = INTOSC_EC    // Oscilador interno (CLKO en RA6)
+#pragma config WDT    = OFF          // Watchdog deshabilitado
+#pragma config BOR    = OFF          // Brown-Out Reset deshabilitado
+#pragma config STVREN = OFF          // Stack Overflow Reset deshabilitado
+#pragma config MCLRE  = ON           // MCLR habilitado (reset de usuario)
+#pragma config PBADEN = OFF          // PORTB digital al arranque
+#pragma config LVP    = OFF          // Programacion en bajo voltaje OFF
+
+/* ---- Prototipos ---- */
+unsigned int Conversion(unsigned char canal);
+void Transmitir(unsigned char dato);
+void TransmitirCadena(const char *cad);
+void TransmitirNumero(unsigned int valor);
+
+void main(void) {
+
+    /* ========================================================
+     * 0. DETECCION DE LA CAUSA DEL RESET (lo PRIMERO de todo)
+     * ======================================================== */
+    unsigned char causaReset = RCON;   // copiar RCON ANTES de tocar nada
+
+    // Re-armar los bits para poder detectar el proximo reset.
+    // POR y BOR son activos en bajo: un POR real los pone en 0.
+    RCONbits.POR = 1;
+    RCONbits.BOR = 1;
+    RCONbits.RI  = 1;
+
+    /* 1. Oscilador interno a 1 MHz */
+    OSCCON = 0b01000100;
+
+    /* 2. ADC */
+    ADCON0 = 0b00000101;   // ADON=1, canal AN1
+    ADCON1 = 13;           // AN0 y AN1 analogicos, resto digital
+    ADCON2 = 0b10001000;   // Justificado derecha, Tad=2*Tosc, Tacq=2 Tad
+
+    /* 3. Puertos */
+    TRISA = 0b00000010;    // RA1 entrada analogica; RA4, RA5 salidas (LCD)
+    LATA  = 0;
+
+    TRISD = 0;             // PORTD salida (datos LCD)
+    LATD  = 0;
+
+    TRISC = 0;             // PORTC salidas por defecto...
+    TRISCbits.TRISC6 = 1;  // ...TX como entrada (lo maneja la EUSART)
+    TRISCbits.TRISC7 = 1;  // ...RX como entrada
+    TRISCbits.TRISC0 = 0;  // RC0 = salida -> base del transistor del motor
+    LATC  = 0;
+    LATCbits.LATC0 = 0;    // motor APAGADO al inicio
+
+    /* 4. UART a 9600 bps (Fosc=1MHz, BRGH=1, BRG16=1, SPBRG=25) */
+    TXSTA   = 0b00100100;
+    RCSTA   = 0b10000000;
+    BAUDCON = 0b00001000;
+    SPBRG   = 25;
+
+    /* 5. LCD */
+    __delay_ms(1000);
+    ConfiguraLCD(4);
+    InicializaLCD();
+
+    /* ========================================================
+     * 6. MOSTRAR LA CAUSA DEL RESET
+     * ======================================================== */
+    DireccionaLCD(0x80);
+    MensajeLCD_Var("Causa del reset:");
+    DireccionaLCD(0xC0);
+
+    // BOR = bit 0 de RCON. En un POR real el hardware lo pone en 0 (RCON=0x28).
+    // Tras un MCLR queda en 1 (RCON=0x31) porque lo re-armamos en software.
+    if ((causaReset & 0b00000001) == 0) {
+        MensajeLCD_Var("Falla de energia");
+        TransmitirCadena("Reset: Falla de energia\r\n");
+    } else {
+        MensajeLCD_Var("Reset de usuario");
+        TransmitirCadena("Reset: Usuario (MCLR)\r\n");
+    }
+
+    // Mantener el mensaje 3 segundos (delay confiable por bucle)
+    for (unsigned char i = 0; i < 30; i++) {
+        __delay_ms(100);
+    }
+    BorraLCD();
+    __delay_ms(5);
+
+    TransmitirCadena("Sistema listo\r\n");
+
+    /* ========================================================
+     * 7. BUCLE PRINCIPAL (muestreo a 1 Hz + control de motor)
+     * ======================================================== */
+    unsigned int resultadoADC;
+
+    while (1) {
+        resultadoADC = Conversion(1);          // Lee el potenciometro (AN1)
+
+        // --- LCD: valor del ADC ---
+        DireccionaLCD(0x80);
+        MensajeLCD_Var("Pot(RA1): ");
+        EscribeLCD_n16(resultadoADC, 4);
+
+        // --- Control del motor segun umbral de 2.5V ---
+        // 2.5V con ADC de 10 bits y Vref=5V  ->  (2.5/5)*1023 ~= 512
+        DireccionaLCD(0xC0);
+        if (resultadoADC > 511) {              // > 2.5V
+            LATCbits.LATC0 = 1;                // motor ENCENDIDO
+            MensajeLCD_Var("Motor: ON       ");
+            TransmitirCadena("ADC=");
+            TransmitirNumero(resultadoADC);
+            TransmitirCadena(" Motor=ON\r\n");
+        } else {                               // < 2.5V
+            LATCbits.LATC0 = 0;                // motor APAGADO
+            MensajeLCD_Var("Motor: OFF      ");
+            TransmitirCadena("ADC=");
+            TransmitirNumero(resultadoADC);
+            TransmitirCadena(" Motor=OFF\r\n");
+        }
+
+        while (!TXSTAbits.TRMT);                // espera fin de transmision UART
+
+        // Muestreo a 1 Hz: 1 segundo entre lecturas
+        for (unsigned char i = 0; i < 10; i++) {
+            __delay_ms(100);
+        }
+    }
+}
+
+/* ============================================================
+ * FUNCIONES
+ * ============================================================ */
+
+/* --- ADC --- */
+unsigned int Conversion(unsigned char canal) {
+    ADCON0 = (ADCON0 & 0b11000011) | (canal << 2);
+    __delay_us(20);       // tiempo de adquisicion extra por seguridad
+    GO = 1;
+    while (GO == 1);
+    return ADRES;
+}
+
+/* --- UART --- */
+void Transmitir(unsigned char dato) {
+    while (!PIR1bits.TXIF);    // espera a que TXREG este vacio
+    TXREG = dato;
+}
+
+void TransmitirCadena(const char *cad) {
+    while (*cad) Transmitir(*cad++);
+}
+
+/* Envia un entero como texto ASCII (ej. 1023 -> '1','0','2','3') */
+void TransmitirNumero(unsigned int valor) {
+    char buffer[6];
+    signed char i = 0;
+    if (valor == 0) { Transmitir('0'); return; }
+    while (valor > 0) { buffer[i++] = '0' + (valor % 10); valor /= 10; }
+    while (i > 0) Transmitir(buffer[--i]);
+}
+
+
+
+
+
+
