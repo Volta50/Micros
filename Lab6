@@ -1,0 +1,717 @@
+// =============================================================================
+//  SISTEMA INTEGRADO - GUIA 6 (Captura + PWM)
+//  Contador por ultrasonido (HC-SR04 via CCP2 captura) + LCD + BCD/7seg + RGB
+//  + Buzzer + HLVD + teclado + RS232 + deteccion de reset
+//  + PWM (CCP1 en RC2) hacia el motor, proporcional al potenciometro (0-100%)
+//  + Telemetria serial cada 1 s: "Valor de PWM: X %" y "Distancia objeto: Y cm"
+//  + Comandos seriales de velocidad: Z/X/C/V/B/N = 0/20/40/60/80/100%
+//    (se conservan P = emergencia y R = reiniciar conteo de la guia anterior)
+// =============================================================================
+//  Pines:
+//    RA0  -> (AN0) sin usar      RA1 -> (AN1) potenciometro
+//    RA2  -> Backlight LCD       RA3 -> Buzzer
+//    RA4  -> LCD E               RA5 -> LCD RS        RA6 -> LED 1 Hz
+//    RB0-RB3 columnas teclado    RB4-RB7 filas teclado
+//    RC0  -> HC-SR04 TRIGGER     RC1 -> HC-SR04 ECHO (CCP2 captura)
+//    RC2  -> PWM al motor (CCP1/P1A, via transistor 2N2222)
+//    RC6  -> TX (HC-05)          RC7 -> RX (HC-05)
+//    RD0-RD3 BCD/7seg            RD4-RD7 datos LCD
+//    RE0-RE2 RGB
+// =============================================================================
+
+#include <xc.h>
+#include <stdio.h>
+
+#define _XTAL_FREQ 1000000
+
+// -- Configuracion de la LCD --------------------------------------------------
+#define RS    LATA5
+#define E     LATA4
+#include "LibLCDXC8.h"
+
+// -- Conexiones del HC-SR04 ---------------------------------------------------
+#define TRIGGER LATCbits.LATC0   // TRIGGER en RC0
+#define ECHO    PORTCbits.RC1    // ECHO en RC1 (entrada de captura CCP2)
+
+// NOTA: el motor ya NO se controla por LATC2. RC2 es la salida PWM de CCP1.
+
+// -- Tecla que conmuta el backlight -------------------------------------------
+#define TECLA_BACKLIGHT 13
+
+// -- Umbrales de inactividad (ms) ---------------------------------------------
+#define MS_APAGA_LUZ    10000U
+#define MS_SUSPENSION   20000U
+
+// -- Fuses --------------------------------------------------------------------
+#pragma config FOSC   = INTOSCIO_EC
+#pragma config WDT    = OFF
+#pragma config BOR    = OFF
+#pragma config STVREN = OFF
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = ON
+#pragma config LVP    = OFF
+
+// -- Variables globales (contador) --------------------------------------------
+volatile unsigned char Tecla           = 0;
+volatile unsigned char TeclaLista      = 0;
+volatile unsigned char counter         = 0;
+volatile unsigned char tens            = 0;
+volatile unsigned char FinalizarConteo = 0;
+volatile unsigned char ReiniciarConteo = 0;
+volatile unsigned char ringRing        = 0;
+volatile unsigned char rangRang        = 0;
+volatile unsigned char initialized     = 0;
+
+volatile unsigned int  tmr0_reload     = 34286;
+
+// -- Inactividad / suspension --------------------------------------------------
+volatile unsigned int  tiempoInactivo  = 0;
+volatile unsigned char backlightOn     = 1;
+volatile unsigned char enSuspension    = 0;
+
+// -- Estados de emergencia / conteo / PWM -------------------------------------
+volatile unsigned char enEmergencia    = 0;
+volatile unsigned char enConteo        = 0;
+volatile unsigned char modoManual      = 0;   // 1 = un comando de velocidad fijo el PWM (pot ignorado)
+volatile unsigned char pwmPct          = 0;   // % de PWM actual (para telemetria)
+
+// -- Muestreo / telemetria a 1 Hz (driven por Timer0) -------------------------
+volatile unsigned int  acumADC         = 0;
+volatile unsigned char flagADC         = 0;
+
+// -- Estado de la deteccion del objeto (HC-SR04) ------------------------------
+volatile unsigned char estadoObjeto    = 0;   // 0 = esperando, 1 = objeto dentro del rango
+volatile unsigned char ultimaDistancia = 255; // ultima distancia medida (cm) para telemetria
+
+// =============================================================================
+//  Caracteres propios (fantasma, 2 cuadros)
+// =============================================================================
+const unsigned char fantasmaArriba[8] = {
+    0b01110, 0b11111, 0b10101, 0b11111, 0b11111, 0b11111, 0b10101, 0b00000
+};
+const unsigned char fantasmaAbajo[8] = {
+    0b00000, 0b01110, 0b11111, 0b10101, 0b11111, 0b11111, 0b11111, 0b01010
+};
+
+// -- Prototipos ----------------------------------------------------------------
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas);
+void buzz(unsigned char shortBuzz);
+void setRGB(void);
+void CreaCaracter(unsigned char pos, const unsigned char *mapa);
+void EntrarSuspension(void);
+void ManejaEmergencia(void);
+void ProcesaComando(unsigned char c);
+void Transmitir(unsigned char dato);
+void TransmitirCadena(const char *cad);
+void TransmitirNumero(unsigned int valor);
+unsigned int Conversion(unsigned char canal);
+void SetPWMduty(unsigned int duty10);
+void SetPWMpct(unsigned char pct);
+void ActualizaPWMpot(void);
+void EnviaTelemetria(void);
+unsigned char MedirDistancia(void);
+void interrupt ISR(void);
+
+// =============================================================================
+//  MAIN
+// =============================================================================
+void main(void) {
+    unsigned char digitoBuf[2]  = {0xFF, 0xFF};
+    unsigned char numDigitos     = 0;
+    unsigned char cuentaObjetivo = 0;
+    unsigned char valorTemporal;
+    unsigned char paso, cuadro = 0;
+
+    // -- 0. CAUSA DEL RESET ---------------------------------------------------
+    unsigned char causaReset = RCON;
+    RCONbits.POR = 1;
+    RCONbits.BOR = 1;
+    RCONbits.RI  = 1;
+
+    // -- Oscilador interno 1 MHz ----------------------------------------------
+    OSCCON = 0b01000011;
+    while (!OSCCONbits.IOFS);
+
+    // -- Prioridades de interrupcion ------------------------------------------
+    IPEN = 1;
+    PEIE = 1;
+    GIE  = 1;
+
+    // -- ADC: AN1 (potenciometro). AN0 y AN1 analogicos, resto digital --------
+    ADCON0 = 0b00000101;
+    ADCON1 = 0x0D;
+    ADCON2 = 0b10001000;
+
+    // -- PORTA: RA0/RA1 entradas analogicas; RA2-RA6 salidas ------------------
+    TRISA  = 0b00000011;
+    LATA   = 0;
+    LATA2  = 1;
+
+    // -- PORTB: teclado matricial ---------------------------------------------
+    TRISB = 0b11110000;
+    LATB  = 0b00000000;
+    RBPU  = 0;
+
+    // -- PORTC: RC0 TRIGGER (out), RC1 ECHO (in), RC2 PWM (out), RC6/7 UART ----
+    TRISC = 0b11000010;     // RC2=0 (salida) -> la maneja CCP1 (PWM)
+    LATC  = 0b00000000;
+    TRIGGER = 0;
+
+    // -- PORTD: BCD (D0-D3) + datos LCD (D4-D7) -------------------------------
+    TRISD = 0;
+    LATD  = 0;
+
+    // -- PORTE: RGB LED (anodo comun, activo bajo) ----------------------------
+    TRISE = 0b1000;
+    LATE  = 0b1111;
+
+    // -- Timer0: LED 1 s + base de telemetria ---------------------------------
+    TMR0    = tmr0_reload;
+    T0CON   = 0b00000010;
+    TMR0IF  = 0;
+    TMR0IE  = 1;
+    TMR0IP  = 1;
+    TMR0ON  = 1;
+
+    // -- Timer1: captura del eco del HC-SR04 (CCP2) ---------------------------
+    T1CON   = 0b10000000;
+
+    // -- Timer2 + CCP1: PWM hacia el motor en RC2 (P1A) -----------------------
+    PR2     = 255;            // periodo PWM (~977 Hz a Fosc=1 MHz, resolucion 10 bits)
+    T2CON   = 0b00000100;     // TMR2 ON, prescaler 1:1
+    CCPR1L  = 0;
+    CCP1CON = 0b00001100;     // modo PWM, ciclo util = 0% al inicio
+    pwmPct  = 0;
+
+    // -- HLVD: detectar caida a ~4 V ------------------------------------------
+    HLVDCON = 0b00001100;
+    HLVDEN  = 1;
+    while (!IRVST);
+    HLVDIF  = 0;
+    HLVDIE  = 1;
+    HLVDIP  = 1;
+
+    // -- UART 9600 bps --------------------------------------------------------
+    TXSTA   = 0b00100100;
+    RCSTA   = 0b10010000;
+    BAUDCON = 0b00001000;
+    SPBRG   = 25;
+    RCIF    = 0;
+    RCIE    = 1;
+    RCIP    = 1;
+
+    INT0IF = 0;
+
+    // -- Interrupcion por cambio en PORTB (teclado) ---------------------------
+    __delay_ms(100);
+    RBIF = 0;
+    RBIE = 1;
+
+    // -- Inicializar LCD ------------------------------------------------------
+    __delay_ms(1000);
+    ConfiguraLCD(4);
+    InicializaLCD();
+    ComandoLCD(0x0C);
+
+    // -- MOSTRAR CAUSA DEL RESET ----------------------------------------------
+    DireccionaLCD(0x80);
+    MensajeLCD_Var((unsigned char *)"Causa del reset:");
+    DireccionaLCD(0xC0);
+    if ((causaReset & 0b00000001) == 0) {
+        MensajeLCD_Var((unsigned char *)"Falla de energia");
+        TransmitirCadena("Reset: Falla de energia\r\n");
+    } else {
+        MensajeLCD_Var((unsigned char *)"Reset de usuario");
+        TransmitirCadena("Reset: Usuario (MCLR)\r\n");
+    }
+    for (unsigned char i = 0; i < 20; i++) {
+        if (enEmergencia) ManejaEmergencia();
+        __delay_ms(100);
+    }
+    BorraLCD();
+    __delay_ms(5);
+    TransmitirCadena("Sistema listo\r\n");
+    TransmitirCadena("Vel: Z X C V B N (0-100%)\r\n");
+
+    // -- Bienvenida animada ---------------------------------------------------
+    CreaCaracter(0, fantasmaArriba);
+    CreaCaracter(1, fantasmaAbajo);
+
+    DireccionaLCD(0x80);
+    MensajeLCD_Var((unsigned char *)"Un dia mas "); DireccionaLCD(0x8B); EscribeLCD_c(0);
+    DireccionaLCD(0xC0);
+    MensajeLCD_Var((unsigned char *)"un dia menos"); DireccionaLCD(0xCD); EscribeLCD_c(1);
+    for (unsigned char i = 0; i < 8; i++) {
+        if (enEmergencia) ManejaEmergencia();
+        __delay_ms(100);
+    }
+
+    cuadro = 0;
+    for (paso = 0; paso < 16; paso++) {
+        if (enEmergencia) ManejaEmergencia();
+        DireccionaLCD(0x8B); EscribeLCD_c(cuadro);
+        DireccionaLCD(0xCD); EscribeLCD_c(cuadro ^ 1);
+        cuadro ^= 1;
+        if ((paso & 0x04) == 0) ComandoLCD(0x1C);
+        else                    ComandoLCD(0x18);
+        __delay_ms(300);
+    }
+
+    // =========================================================================
+    //  MENU OBJETIVO
+    // =========================================================================
+    MENU_OBJETIVO:
+    digitoBuf[0]    = 0xFF;
+    digitoBuf[1]    = 0xFF;
+    numDigitos      = 0;
+    cuentaObjetivo  = 0;
+    counter         = 0;
+    tens            = 0;
+    FinalizarConteo = 0;
+    ReiniciarConteo = 0;
+    TeclaLista      = 0;
+    initialized     = 0;
+    enConteo        = 0;
+    LATE            = 0b1111;
+    LATD            = 0;
+    estadoObjeto    = 0;
+
+    tiempoInactivo  = 0;
+    backlightOn     = 1;
+    LATA2           = 1;
+
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"Digite la cuenta");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"objetivo: __");
+
+    while (cuentaObjetivo == 0) {
+        if (enEmergencia) ManejaEmergencia();
+        ActualizaPWMpot();                        // pot -> PWM (continuo)
+        EnviaTelemetria();                        // 1 Hz: PWM% + distancia por serial
+
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0;
+        }
+
+        if (TeclaLista) {
+            TeclaLista = 0;
+            unsigned char t = Tecla;
+
+            if (t == 10) {
+                if      (numDigitos == 1) valorTemporal = digitoBuf[0];
+                else if (numDigitos == 2) valorTemporal = digitoBuf[0] * 10 + digitoBuf[1];
+                else                      valorTemporal = 0;
+
+                if (valorTemporal >= 1 && valorTemporal <= 59) {
+                    cuentaObjetivo = valorTemporal;
+                    DireccionaLCD(0xCC); EscribeLCD_c('O'); EscribeLCD_c('K');
+                    __delay_ms(1000);
+                } else {
+                    DireccionaLCD(0xCA); EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('R');
+                    __delay_ms(1500);
+                    DireccionaLCD(0xCA); EscribeLCD_c('_'); EscribeLCD_c('_'); EscribeLCD_c(' ');
+                    numDigitos   = 0;
+                    digitoBuf[0] = 0xFF; digitoBuf[1] = 0xFF;
+                }
+            } else if (t == 12) {
+                if (numDigitos > 0) {
+                    numDigitos--;
+                    digitoBuf[numDigitos] = 0xFF;
+                    DireccionaLCD(0xC9 + numDigitos + 1); EscribeLCD_c('_');
+                }
+            } else if (t <= 9 && numDigitos < 2) {
+                digitoBuf[numDigitos] = t;
+                numDigitos++;
+                DireccionaLCD(0xC9 + numDigitos); EscribeLCD_c('0' + t);
+            }
+        }
+    }
+
+    // -- Pantalla de conteo ---------------------------------------------------
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"Piezas falt: __");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"Cuenta obj.: ");
+    if (cuentaObjetivo >= 10) {
+        EscribeLCD_c('0' + (cuentaObjetivo / 10));
+        EscribeLCD_c('0' + (cuentaObjetivo % 10));
+    } else {
+        EscribeLCD_c(' '); EscribeLCD_c('0' + cuentaObjetivo);
+    }
+
+    enConteo = 1;
+    unsigned char counterAnterior = 0xFF;
+
+    // =========================================================================
+    //  BUCLE PRINCIPAL DE CONTEO (ULTRASONIDO + PWM)
+    // =========================================================================
+    while (1) {
+        if (enEmergencia) ManejaEmergencia();
+        ActualizaPWMpot();                        // pot -> PWM (continuo)
+        EnviaTelemetria();                        // 1 Hz: PWM% + distancia por serial
+
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+            counterAnterior = 0xFF;
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0;
+        }
+
+        if (FinalizarConteo) {
+            goto MENU_OBJETIVO;
+        }
+
+        if (ReiniciarConteo) {
+            ReiniciarConteo = 0;
+            counter         = 0;
+            tens            = 0;
+            initialized     = 0;
+            estadoObjeto    = 0;
+            LATE            = 0b1111;
+            LATD            = 0;
+            counterAnterior = 0xFF;
+        }
+
+        // -- Logica de Conteo con HC-SR04 (objeto entre 5 y 8 cm) ------------
+        unsigned char dist = MedirDistancia();
+        ultimaDistancia = dist;
+
+        if (dist >= 5 && dist <= 8) {
+            if (estadoObjeto == 0) {
+                estadoObjeto = 1;
+                if (!initialized) {
+                    initialized = 1;
+                    LATE = 0b1010;
+                }
+            }
+        }
+        else if (dist > 8 && dist != 255) {
+            if (estadoObjeto == 1) {
+                estadoObjeto = 0;
+                counter++;
+                tiempoInactivo = 0;
+                LATA2 = backlightOn;
+
+                if (counter >= 10) {
+                    counter = 0;
+                    tens++;
+                    setRGB();
+                }
+                LATD = counter & 0x0F;
+            }
+        }
+
+        if (counter != counterAnterior) {
+            counterAnterior = counter;
+            unsigned char totalContadas = (unsigned char)(tens * 10 + counter);
+            ActualizaLCD(cuentaObjetivo, totalContadas);
+            LATD = counter & 0x0F;
+        }
+
+        if (rangRang) {
+            buzz(0);
+            rangRang = 0; ringRing = 0;
+        } else if (ringRing) {
+            buzz(1);
+            ringRing = 0;
+        }
+
+        __delay_ms(20);
+    }
+}
+
+// =============================================================================
+//  HC-SR04: medir distancia (captura por CCP2). Devuelve cm o 255 (sin eco).
+// =============================================================================
+unsigned char MedirDistancia(void) {
+    unsigned char aux = 0;
+    unsigned int  guard;
+
+    CCP2CON = 0b00000100;   // CCP2 captura por flanco de bajada (fin del eco en RC1)
+    TMR1   = 0;
+    CCP2IF = 0;
+    TMR1IF = 0;
+
+    TRIGGER = 1;
+    __delay_us(20);            // >=10 us garantizado (a 1 MHz el margen es justo)
+    TRIGGER = 0;
+
+    guard = 0;
+    while (ECHO == 0) {                 // espera inicio del eco (timeout ~36 ms, no 1.5 s)
+        if (++guard > 1500) return 255;
+    }
+
+    TMR1ON = 1;
+    while (CCP2IF == 0 && TMR1IF == 0); // espera fin del eco o desborde
+    TMR1ON = 0;
+
+    if (TMR1IF == 1) {
+        aux = 255;
+        TMR1IF = 0;
+    } else {
+        if (CCPR2 >= 3556) CCPR2 = 3556;
+        aux = (unsigned char)(CCPR2 / 14);
+    }
+    return aux;
+}
+
+// =============================================================================
+//  PWM: fija el ciclo util por valor de 10 bits (0..1023) y calcula el %
+// =============================================================================
+void SetPWMduty(unsigned int duty10) {
+    if (duty10 > 1023) duty10 = 1023;
+    CCPR1L  = (unsigned char)(duty10 >> 2);                       // 8 MSB
+    CCP1CON = (unsigned char)(0b00001100 | ((duty10 & 0x03) << 4)); // PWM + 2 LSB
+    pwmPct  = (unsigned char)(((unsigned long)duty10 * 100UL) / 1023UL);
+}
+
+// PWM por porcentaje exacto (para los comandos de velocidad)
+void SetPWMpct(unsigned char pct) {
+    if (pct > 100) pct = 100;
+    unsigned int duty = (unsigned int)(((unsigned long)pct * 1023UL) / 100UL);
+    CCPR1L  = (unsigned char)(duty >> 2);
+    CCP1CON = (unsigned char)(0b00001100 | ((duty & 0x03) << 4));
+    pwmPct  = pct;
+}
+
+// El potenciometro fija el PWM (0-100%), salvo modo manual o emergencia
+void ActualizaPWMpot(void) {
+    if (modoManual || enEmergencia) return;
+    SetPWMduty(Conversion(1));     // ADC 0..1023 -> ciclo util 0..100%
+}
+
+// =============================================================================
+//  Telemetria a 1 Hz: envia PWM% y distancia por serial (ASCII)
+// =============================================================================
+void EnviaTelemetria(void) {
+    if (!flagADC) return;
+    flagADC = 0;
+
+    TransmitirCadena("Valor de PWM: ");
+    TransmitirNumero(pwmPct);
+    TransmitirCadena(" %\r\n");
+
+    TransmitirCadena("Distancia objeto: ");
+    if (ultimaDistancia == 255) TransmitirCadena("---");
+    else                        TransmitirNumero(ultimaDistancia);
+    TransmitirCadena(" cm\r\n");
+}
+
+// =============================================================================
+//  Manejo de Emergencia, Comandos Seriales y Perifericos
+// =============================================================================
+void ManejaEmergencia(void) {
+    SetPWMduty(0);                     // motor a 0%
+    LATE   = 0b1110;
+    LATA2  = 1; backlightOn = 1;
+
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"!! EMERGENCIA !!");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"Sistema detenido");
+
+    while (enEmergencia) {
+        // Bloqueado hasta Reset por MCLR
+    }
+}
+
+void ProcesaComando(unsigned char c) {
+    switch (c) {
+        // -- Sistema (heredados de la guia 5) --------------------------------
+        case 'P': case 'p':                 // parada de emergencia
+            if (!enEmergencia) {
+                enEmergencia = 1; enConteo = 0;
+                SetPWMduty(0);
+                LATE = 0b1110;
+                TransmitirCadena("CMD P: EMERGENCY\r\n");
+            }
+            break;
+        case 'R': case 'r':                 // reiniciar conteo
+            if (enConteo && !enEmergencia) {
+                ReiniciarConteo = 1;
+                TransmitirCadena("CMD R: Reinicio conteo\r\n");
+            }
+            break;
+
+        // -- Velocidad del motor por PWM (toman el control, ignoran el pot) --
+        case 'Z': case 'z':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(0);   TransmitirCadena("PWM: 0%\r\n"); }
+            break;
+        case 'X': case 'x':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(20);  TransmitirCadena("PWM: 20%\r\n"); }
+            break;
+        case 'C': case 'c':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(40);  TransmitirCadena("PWM: 40%\r\n"); }
+            break;
+        case 'V': case 'v':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(60);  TransmitirCadena("PWM: 60%\r\n"); }
+            break;
+        case 'B': case 'b':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(80);  TransmitirCadena("PWM: 80%\r\n"); }
+            break;
+        case 'N': case 'n':
+            if (!enEmergencia) { modoManual = 1; SetPWMpct(100); TransmitirCadena("PWM: 100%\r\n"); }
+            break;
+    }
+}
+
+void Transmitir(unsigned char dato) {
+    while (!PIR1bits.TXIF);
+    TXREG = dato;
+}
+
+void TransmitirCadena(const char *cad) {
+    while (*cad) Transmitir((unsigned char)*cad++);
+}
+
+void TransmitirNumero(unsigned int valor) {
+    char buffer[6];
+    signed char i = 0;
+    if (valor == 0) { Transmitir('0'); return; }
+    while (valor > 0) { buffer[i++] = (char)('0' + (valor % 10)); valor /= 10; }
+    while (i > 0) Transmitir((unsigned char)buffer[--i]);
+}
+
+unsigned int Conversion(unsigned char canal) {
+    ADCON0 = (unsigned char)((ADCON0 & 0b11000011) | (canal << 2));
+    __delay_us(20);
+    GO = 1;
+    while (GO == 1);
+    return ADRES;
+}
+
+void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
+    ComandoLCD((unsigned char)(0x40 | (pos << 3)));
+    for (unsigned char i = 0; i < 8; i++) EscribeLCD_c(mapa[i]);
+    DireccionaLCD(0x80);
+}
+
+void EntrarSuspension(void) {
+    LATA2 = 0; LATA6 = 0; LATE = 0b1111;
+    backlightOn  = 1;
+    enSuspension = 1;
+    RBIF = 0; RBIE = 1; GIE = 1;
+
+    asm("SLEEP");
+    asm("NOP");
+
+    enSuspension   = 0;
+    tiempoInactivo = 0;
+    LATA2          = 1;
+    backlightOn    = 1;
+}
+
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas) {
+    unsigned char faltantes = (contadas >= objetivo) ? 0 : (unsigned char)(objetivo - contadas);
+    DireccionaLCD(0x8D);
+    if (faltantes >= 10) {
+        EscribeLCD_c((unsigned char)('0' + (faltantes / 10)));
+        EscribeLCD_c((unsigned char)('0' + (faltantes % 10)));
+    } else {
+        EscribeLCD_c(' '); EscribeLCD_c((unsigned char)('0' + faltantes));
+    }
+}
+
+void buzz(unsigned char shortBuzz) {
+    GIE   = 0;
+    LATA3 = 1;
+    if (shortBuzz) __delay_ms(80);
+    else           __delay_ms(1500);
+    LATA3 = 0;
+    GIE   = 1;
+}
+
+void setRGB(void) {
+    switch (tens) {
+        case 0: LATE = 0b1010; break;
+        case 1: LATE = 0b1011; ringRing = 1; break;
+        case 2: LATE = 0b1001; ringRing = 1; break;
+        case 3: LATE = 0b1101; ringRing = 1; break;
+        case 4: LATE = 0b1100; ringRing = 1; break;
+        case 5: LATE = 0b1000; ringRing = 1; break;
+        case 6: tens = 0; LATE = 0b1010; rangRang = 1; break;
+        default: LATE = 0b1111; break;
+    }
+}
+
+// =============================================================================
+//  ISR DE ALTA PRIORIDAD
+// =============================================================================
+void interrupt ISR(void) {
+    if (TMR0IF == 1) {
+        TMR0IF = 0;
+        TMR0   = tmr0_reload;
+        LATA6  = LATA6 ^ 1;     // LED que parpadea cada segundo (RA6)
+        if (tiempoInactivo < 60000) {
+            tiempoInactivo += (tmr0_reload == 57724) ? 250 : 1000;
+        }
+        acumADC += (tmr0_reload == 57724) ? 250 : 1000;
+        if (acumADC >= 1000) { acumADC = 0; flagADC = 1; }
+    }
+
+    if (HLVDIF == 1) {
+        HLVDIE = 0;
+        if (VDIRMAG == 0) { tmr0_reload = 57724; VDIRMAG = 1; }
+        else              { tmr0_reload = 34286; VDIRMAG = 0; }
+        while (!IRVST);
+        HLVDIF = 0; HLVDIE = 1;
+    }
+
+    if (PIR1bits.RCIF == 1) {
+        if (RCSTAbits.OERR) { RCSTAbits.CREN = 0; RCSTAbits.CREN = 1; }
+        unsigned char c = RCREG;
+        tiempoInactivo = 0;
+        if (LATA2 == 0 && !enSuspension) LATA2 = backlightOn;
+        ProcesaComando(c);
+    }
+
+    if (RBIF == 1) {
+        if (PORTB != 0b11110000) {
+            Tecla = 0;
+            LATB = 0b11111110;
+            if      (PORTBbits.RB4 == 0) Tecla = 13;
+            else if (PORTBbits.RB5 == 0) Tecla = 12;
+            else if (PORTBbits.RB6 == 0) Tecla = 11;
+            else if (PORTBbits.RB7 == 0) Tecla = 10;
+            else {
+                LATB = 0b11111101;
+                if      (PORTBbits.RB4 == 0) Tecla = 15;
+                else if (PORTBbits.RB5 == 0) Tecla = 9;
+                else if (PORTBbits.RB6 == 0) Tecla = 6;
+                else if (PORTBbits.RB7 == 0) Tecla = 3;
+                else {
+                    LATB = 0b11111011;
+                    if      (PORTBbits.RB4 == 0) Tecla = 0;
+                    else if (PORTBbits.RB5 == 0) Tecla = 8;
+                    else if (PORTBbits.RB6 == 0) Tecla = 5;
+                    else if (PORTBbits.RB7 == 0) Tecla = 2;
+                    else {
+                        LATB = 0b11110111;
+                        if      (PORTBbits.RB4 == 0) Tecla = 14;
+                        else if (PORTBbits.RB5 == 0) Tecla = 7;
+                        else if (PORTBbits.RB6 == 0) Tecla = 4;
+                        else if (PORTBbits.RB7 == 0) Tecla = 1;
+                    }
+                }
+            }
+            LATB = 0b00000000;
+            tiempoInactivo = 0;
+
+            if (enSuspension) { enSuspension = 0; }
+            else {
+                if (Tecla == 11) {
+                    if (!enEmergencia) { enEmergencia = 1; enConteo = 0; SetPWMduty(0); LATE = 0b1110; }
+                }
+                else if (Tecla == 14) { ReiniciarConteo = 1; }
+                else if (Tecla == 15) { FinalizarConteo = 1; }
+                else if (Tecla == TECLA_BACKLIGHT) { backlightOn ^= 1; }
+                else { TeclaLista = 1; }
+                LATA2 = backlightOn;
+            }
+        }
+        __delay_ms(100);
+        RBIF = 0;
+    }
+}
