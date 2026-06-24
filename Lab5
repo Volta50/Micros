@@ -201,7 +201,10 @@ void main(void) {
         MensajeLCD_Var((unsigned char *)"Reset de usuario");
         TransmitirCadena("Reset: Usuario (MCLR)\r\n");
     }
-    for (unsigned char i = 0; i < 20; i++) __delay_ms(100);
+    for (unsigned char i = 0; i < 20; i++) {
+        if (enEmergencia) ManejaEmergencia();   // emergencia tambien en el arranque
+        __delay_ms(100);
+    }
     BorraLCD();
     __delay_ms(5);
     TransmitirCadena("Sistema listo\r\n");
@@ -215,10 +218,14 @@ void main(void) {
     MensajeLCD_Var((unsigned char *)"Un dia mas "); DireccionaLCD(0x8B); EscribeLCD_c(0);
     DireccionaLCD(0xC0);
     MensajeLCD_Var((unsigned char *)"un dia menos"); DireccionaLCD(0xCD); EscribeLCD_c(1);
-    __delay_ms(800);
+    for (unsigned char i = 0; i < 8; i++) {
+        if (enEmergencia) ManejaEmergencia();
+        __delay_ms(100);
+    }
 
     cuadro = 0;
     for (paso = 0; paso < 16; paso++) {
+        if (enEmergencia) ManejaEmergencia();
         DireccionaLCD(0x8B); EscribeLCD_c(cuadro);
         DireccionaLCD(0xCD); EscribeLCD_c(cuadro ^ 1);
         cuadro ^= 1;
