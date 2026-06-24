@@ -1,8 +1,20 @@
 // =============================================================================
 //  SISTEMA INTEGRADO CON SENSOR ULTRASONICO HC-SR04 (Guia 5)
 //  Contador por Ultrasonido + LCD + BCD/7seg + RGB + Buzzer + HLVD
-//  + Potenciometro (ADC a 1 Hz) -> motor + envio del valor por serial (ASCII)
+//  + Potenciometro (ADC a 1 Hz) -> motor ON/OFF + envio del valor por serial
 //  + Comandos seriales P/E/A/R   + deteccion de causa del reset
+// =============================================================================
+//  Pines (mismo pinout que la Guia 6):
+//    RA0/AN0 -> sin usar (analogico)   RA1/AN1 -> potenciometro 1k
+//    RA2  -> Backlight LCD             RA3 -> Buzzer
+//    RA4  -> LCD E                     RA5 -> LCD RS
+//    RA6  -> LED indicador 1 Hz
+//    RB0-RB3 columnas teclado          RB4-RB7 filas teclado
+//    RC0  -> HC-SR04 TRIGGER           RC1 -> HC-SR04 ECHO (CCP2 captura)
+//    RC2  -> Motor (transistor, ON/OFF)
+//    RC6  -> TX (HC-05)                RC7 -> RX (HC-05)
+//    RD0-RD3 BCD/7seg                  RD4-RD7 datos LCD
+//    RE0-RE2 RGB                       RE3 -> MCLR
 // =============================================================================
 
 #include <xc.h>
@@ -20,7 +32,7 @@
 #define ECHO    PORTCbits.RC1    // ECHO en RC1
 
 // -- Motor en RC2 -------------------------------------------------------------
-#define MOTOR   LATCbits.LATC2   // MOTOR en RC2 (libera RC0/RC1 para el HC-SR04)
+#define MOTOR   LATCbits.LATC2   // MOTOR en RC2
 
 // -- Tecla que conmuta el backlight -------------------------------------------
 #define TECLA_BACKLIGHT 13
@@ -63,11 +75,11 @@ volatile unsigned char motorOn         = 0;
 volatile unsigned char modoManual      = 0;   // 1 = un comando serial tomo el control del motor
 
 // -- Muestreo del ADC a 1 Hz (driven por Timer0) ------------------------------
-volatile unsigned int  acumADC         = 0;   // ms acumulados
-volatile unsigned char flagADC         = 0;   // 1 = toca leer y enviar el ADC
+volatile unsigned int  acumADC         = 0;
+volatile unsigned char flagADC         = 0;
 
 // -- Estado de la deteccion del objeto (HC-SR04) ------------------------------
-volatile unsigned char estadoObjeto    = 0;   // 0 = esperando, 1 = objeto dentro del rango
+volatile unsigned char estadoObjeto    = 0;
 
 // =============================================================================
 //  Caracteres propios (fantasma, 2 cuadros)
@@ -158,7 +170,7 @@ void main(void) {
     TMR0ON  = 1;
 
     // -- Timer1: medicion del eco del HC-SR04 ---------------------------------
-    T1CON   = 0b10000000;   // RD16=1, reloj interno Fosc/4, prescaler 1:1, apagado
+    T1CON   = 0b10000000;
 
     // -- HLVD: detectar caida a ~4 V ------------------------------------------
     HLVDCON = 0b00001100;
@@ -170,7 +182,7 @@ void main(void) {
 
     // -- UART 9600 bps --------------------------------------------------------
     TXSTA   = 0b00100100;
-    RCSTA   = 0b10010000;   // SPEN=1, CREN=1 (recepcion habilitada)
+    RCSTA   = 0b10010000;
     BAUDCON = 0b00001000;
     SPBRG   = 25;
     RCIF    = 0;
@@ -202,7 +214,7 @@ void main(void) {
         TransmitirCadena("Reset: Usuario (MCLR)\r\n");
     }
     for (unsigned char i = 0; i < 20; i++) {
-        if (enEmergencia) ManejaEmergencia();   // emergencia tambien en el arranque
+        if (enEmergencia) ManejaEmergencia();
         __delay_ms(100);
     }
     BorraLCD();
@@ -263,7 +275,7 @@ void main(void) {
 
     while (cuentaObjetivo == 0) {
         if (enEmergencia) ManejaEmergencia();
-        MuestreaEnviaADC();                       // ADC 1 Hz: envia por serial + motor
+        MuestreaEnviaADC();
 
         if (tiempoInactivo >= MS_SUSPENSION) {
             EntrarSuspension();
@@ -325,7 +337,7 @@ void main(void) {
     // =========================================================================
     while (1) {
         if (enEmergencia) ManejaEmergencia();
-        MuestreaEnviaADC();                       // ADC 1 Hz: envia por serial + motor
+        MuestreaEnviaADC();
 
         if (tiempoInactivo >= MS_SUSPENSION) {
             EntrarSuspension();
@@ -355,7 +367,7 @@ void main(void) {
 
         if (dist >= 5 && dist <= 8) {
             if (estadoObjeto == 0) {
-                estadoObjeto = 1;            // El objeto entro en el rango 5-8 cm
+                estadoObjeto = 1;
                 if (!initialized) {
                     initialized = 1;
                     LATE = 0b1010;
@@ -364,7 +376,7 @@ void main(void) {
         }
         else if (dist > 8 && dist != 255) {
             if (estadoObjeto == 1) {
-                estadoObjeto = 0;            // El objeto salio del rango -> cuenta
+                estadoObjeto = 0;
                 counter++;
                 tiempoInactivo = 0;
                 LATA2 = backlightOn;
@@ -393,35 +405,34 @@ void main(void) {
             ringRing = 0;
         }
 
-        __delay_ms(40);
+        __delay_ms(20);     // <-- reducido de 40 a 20 ms para fluidez del conteo
     }
 }
 
 // =============================================================================
-//  FUNCION: Medir Distancia con HC-SR04 (con timeout anti-cuelgue)
+//  HC-SR04: Medir Distancia (con timeout corto anti-cuelgue)
 //  Devuelve cm, o 255 si no hay eco / fuera de rango.
 // =============================================================================
 unsigned char MedirDistancia(void) {
     unsigned char aux = 0;
     unsigned int  guard;
 
-    CCP2CON = 0b00000100;   // CCP2 captura por flanco de bajada (fin del eco en RC1)
+    CCP2CON = 0b00000100;   // CCP2 captura por flanco de bajada
     TMR1   = 0;
     CCP2IF = 0;
-    TMR1IF = 0;             // limpiar overflow previo
+    TMR1IF = 0;
 
-    TRIGGER = 1;            // pulso de disparo
-    __delay_us(10);
+    TRIGGER = 1;
+    __delay_us(20);          // <-- 20 us (antes 10): mas confiable a 1 MHz
     TRIGGER = 0;
 
-    // Espera a que ECHO suba, con timeout (si el sensor no responde no se cuelga)
     guard = 0;
     while (ECHO == 0) {
-        if (++guard > 60000) return 255;
+        if (++guard > 1500) return 255;   // <-- timeout ~36 ms (antes 60000 ~1.5 s)
     }
 
     TMR1ON = 1;
-    while (CCP2IF == 0 && TMR1IF == 0);   // espera fin del eco o desborde
+    while (CCP2IF == 0 && TMR1IF == 0);
     TMR1ON = 0;
 
     if (TMR1IF == 1) {
@@ -435,7 +446,7 @@ unsigned char MedirDistancia(void) {
 }
 
 // =============================================================================
-//  Manejo de Emergencia, Comandos Seriales y Perifericos
+//  Manejo de Emergencia
 // =============================================================================
 void ManejaEmergencia(void) {
     MOTOR  = 0; motorOn = 0;
@@ -451,6 +462,9 @@ void ManejaEmergencia(void) {
     }
 }
 
+// =============================================================================
+//  Comandos seriales (Guia 5: P/E/A/R)
+// =============================================================================
 void ProcesaComando(unsigned char c) {
     switch (c) {
         case 'P': case 'p':
@@ -481,6 +495,9 @@ void ProcesaComando(unsigned char c) {
     }
 }
 
+// =============================================================================
+//  UART
+// =============================================================================
 void Transmitir(unsigned char dato) {
     while (!PIR1bits.TXIF);
     TXREG = dato;
@@ -490,7 +507,6 @@ void TransmitirCadena(const char *cad) {
     while (*cad) Transmitir((unsigned char)*cad++);
 }
 
-// Envia un entero como texto ASCII (ej. 553 -> '5','5','3')
 void TransmitirNumero(unsigned int valor) {
     char buffer[6];
     signed char i = 0;
@@ -499,6 +515,9 @@ void TransmitirNumero(unsigned int valor) {
     while (i > 0) Transmitir((unsigned char)buffer[--i]);
 }
 
+// =============================================================================
+//  ADC
+// =============================================================================
 unsigned int Conversion(unsigned char canal) {
     ADCON0 = (unsigned char)((ADCON0 & 0b11000011) | (canal << 2));
     __delay_us(20);
@@ -508,11 +527,7 @@ unsigned int Conversion(unsigned char canal) {
 }
 
 // =============================================================================
-//  Muestreo del potenciometro a 1 Hz:
-//   - lee el ADC (AN1)
-//   - lo envia por serial en ASCII ("Valor del ADC: NNN")
-//   - controla el motor por umbral de 2.5V (ADC > 511), salvo override serial
-//  El disparo (flagADC) lo genera el Timer0 cada 1 segundo.
+//  Muestreo del potenciometro a 1 Hz + envio serial + control motor ON/OFF
 // =============================================================================
 void MuestreaEnviaADC(void) {
     if (!flagADC) return;
@@ -525,11 +540,14 @@ void MuestreaEnviaADC(void) {
     TransmitirCadena("\r\n");
 
     if (!modoManual && !enEmergencia) {
-        if (adc > 511) { MOTOR = 1; motorOn = 1; }   // > 2.5V -> ON
-        else           { MOTOR = 0; motorOn = 0; }   // < 2.5V -> OFF
+        if (adc > 511) { MOTOR = 1; motorOn = 1; }
+        else           { MOTOR = 0; motorOn = 0; }
     }
 }
 
+// =============================================================================
+//  Funciones auxiliares
+// =============================================================================
 void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
     ComandoLCD((unsigned char)(0x40 | (pos << 3)));
     for (unsigned char i = 0; i < 8; i++) EscribeLCD_c(mapa[i]);
@@ -591,11 +609,10 @@ void interrupt ISR(void) {
     if (TMR0IF == 1) {
         TMR0IF = 0;
         TMR0   = tmr0_reload;
-        LATA6  = LATA6 ^ 1;     // LED que parpadea cada segundo (RA6)
+        LATA6  = LATA6 ^ 1;
         if (tiempoInactivo < 60000) {
             tiempoInactivo += (tmr0_reload == 57724) ? 250 : 1000;
         }
-        // -- Base de tiempo para el muestreo del ADC a 1 Hz ------------------
         acumADC += (tmr0_reload == 57724) ? 250 : 1000;
         if (acumADC >= 1000) { acumADC = 0; flagADC = 1; }
     }
@@ -664,3 +681,5 @@ void interrupt ISR(void) {
         RBIF = 0;
     }
 }
+
+
