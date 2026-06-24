@@ -1,188 +1,659 @@
-/* ============================================================
- * Proyecto: PIC18F4550 - Control de motor por umbral de ADC
- * Fosc = 1 MHz (oscilador interno)
- * BaudRate = 9600 bps (HC-05)
- *
- * Funcionalidad:
- *  1) Al arrancar, muestra en el LCD la causa del reset anterior:
- *     "Falla de energia" (POR) o "Reset de usuario" (MCLR).
- *     Las demas fuentes de reset (BOR, WDT, Stack) estan desactivadas.
- *  2) Lee un potenciometro de 1k en AN1 (RA1) a una frecuencia de 1 Hz.
- *  3) Si el valor analogo es mayor a 2.5 V (ADC > 511) -> motor ON
- *     Si es menor -> motor OFF.
- *     El motor se controla con un transistor en RC0.
- *  4) Muestra el valor del ADC y el estado del motor en el LCD,
- *     y lo envia por Bluetooth (HC-05).
- * ============================================================ */
+// =============================================================================
+//  SISTEMA INTEGRADO CON SENSOR ULTRASONICO HC-SR04 (Guia 5)
+//  Contador por Ultrasonido + LCD + BCD/7seg + RGB + Buzzer + HLVD
+//  + Potenciometro (ADC a 1 Hz) -> motor + envio del valor por serial (ASCII)
+//  + Comandos seriales P/E/A/R   + deteccion de causa del reset
+// =============================================================================
 
 #include <xc.h>
+#include <stdio.h>
+
 #define _XTAL_FREQ 1000000
 
-/* Pines del LCD (definir ANTES de incluir la libreria) */
+// -- Configuracion de la LCD --------------------------------------------------
 #define RS    LATA5
 #define E     LATA4
 #include "LibLCDXC8.h"
 
-/* ---- Bits de configuracion ---- */
-#pragma config FOSC   = INTOSC_EC    // Oscilador interno (CLKO en RA6)
-#pragma config WDT    = OFF          // Watchdog deshabilitado
-#pragma config BOR    = OFF          // Brown-Out Reset deshabilitado
-#pragma config STVREN = OFF          // Stack Overflow Reset deshabilitado
-#pragma config MCLRE  = ON           // MCLR habilitado (reset de usuario)
-#pragma config PBADEN = OFF          // PORTB digital al arranque
-#pragma config LVP    = OFF          // Programacion en bajo voltaje OFF
+// -- Conexiones del HC-SR04 ---------------------------------------------------
+#define TRIGGER LATCbits.LATC0   // TRIGGER en RC0
+#define ECHO    PORTCbits.RC1    // ECHO en RC1
 
-/* ---- Prototipos ---- */
-unsigned int Conversion(unsigned char canal);
+// -- Motor en RC2 -------------------------------------------------------------
+#define MOTOR   LATCbits.LATC2   // MOTOR en RC2 (libera RC0/RC1 para el HC-SR04)
+
+// -- Tecla que conmuta el backlight -------------------------------------------
+#define TECLA_BACKLIGHT 13
+
+// -- Umbrales de inactividad (ms) ---------------------------------------------
+#define MS_APAGA_LUZ    10000U
+#define MS_SUSPENSION   20000U
+
+// -- Fuses --------------------------------------------------------------------
+#pragma config FOSC   = INTOSCIO_EC   // oscilador interno, RA6 como I/O
+#pragma config WDT    = OFF
+#pragma config BOR    = OFF           // otras fuentes de reset desactivadas
+#pragma config STVREN = OFF           // otras fuentes de reset desactivadas
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = ON            // reset de usuario (MCLR)
+#pragma config LVP    = OFF
+
+// -- Variables globales (contador) --------------------------------------------
+volatile unsigned char Tecla           = 0;
+volatile unsigned char TeclaLista      = 0;
+volatile unsigned char counter         = 0;
+volatile unsigned char tens            = 0;
+volatile unsigned char FinalizarConteo = 0;
+volatile unsigned char ReiniciarConteo = 0;
+volatile unsigned char ringRing        = 0;
+volatile unsigned char rangRang        = 0;
+volatile unsigned char initialized     = 0;
+
+volatile unsigned int  tmr0_reload     = 34286;
+
+// -- Inactividad / suspension --------------------------------------------------
+volatile unsigned int  tiempoInactivo  = 0;
+volatile unsigned char backlightOn     = 1;
+volatile unsigned char enSuspension    = 0;
+
+// -- Estados de motor / emergencia / conteo -----------------------------------
+volatile unsigned char enEmergencia    = 0;
+volatile unsigned char enConteo        = 0;
+volatile unsigned char motorOn         = 0;
+volatile unsigned char modoManual      = 0;   // 1 = un comando serial tomo el control del motor
+
+// -- Muestreo del ADC a 1 Hz (driven por Timer0) ------------------------------
+volatile unsigned int  acumADC         = 0;   // ms acumulados
+volatile unsigned char flagADC         = 0;   // 1 = toca leer y enviar el ADC
+
+// -- Estado de la deteccion del objeto (HC-SR04) ------------------------------
+volatile unsigned char estadoObjeto    = 0;   // 0 = esperando, 1 = objeto dentro del rango
+
+// =============================================================================
+//  Caracteres propios (fantasma, 2 cuadros)
+// =============================================================================
+const unsigned char fantasmaArriba[8] = {
+    0b01110, 0b11111, 0b10101, 0b11111, 0b11111, 0b11111, 0b10101, 0b00000
+};
+const unsigned char fantasmaAbajo[8] = {
+    0b00000, 0b01110, 0b11111, 0b10101, 0b11111, 0b11111, 0b11111, 0b01010
+};
+
+// -- Prototipos ----------------------------------------------------------------
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas);
+void buzz(unsigned char shortBuzz);
+void setRGB(void);
+void CreaCaracter(unsigned char pos, const unsigned char *mapa);
+void EntrarSuspension(void);
+void ManejaEmergencia(void);
+void ProcesaComando(unsigned char c);
 void Transmitir(unsigned char dato);
 void TransmitirCadena(const char *cad);
 void TransmitirNumero(unsigned int valor);
+unsigned int Conversion(unsigned char canal);
+void MuestreaEnviaADC(void);
+unsigned char MedirDistancia(void);
+void interrupt ISR(void);
 
+// =============================================================================
+//  MAIN
+// =============================================================================
 void main(void) {
+    unsigned char digitoBuf[2]  = {0xFF, 0xFF};
+    unsigned char numDigitos     = 0;
+    unsigned char cuentaObjetivo = 0;
+    unsigned char valorTemporal;
+    unsigned char paso, cuadro = 0;
 
-    /* ========================================================
-     * 0. DETECCION DE LA CAUSA DEL RESET (lo PRIMERO de todo)
-     * ======================================================== */
-    unsigned char causaReset = RCON;   // copiar RCON ANTES de tocar nada
-
-    // Re-armar los bits para poder detectar el proximo reset.
-    // POR y BOR son activos en bajo: un POR real los pone en 0.
+    // -- 0. CAUSA DEL RESET ---------------------------------------------------
+    unsigned char causaReset = RCON;
     RCONbits.POR = 1;
     RCONbits.BOR = 1;
     RCONbits.RI  = 1;
 
-    /* 1. Oscilador interno a 1 MHz */
-    OSCCON = 0b01000100;
+    // -- Oscilador interno 1 MHz ----------------------------------------------
+    OSCCON = 0b01000011;
+    while (!OSCCONbits.IOFS);
 
-    /* 2. ADC */
-    ADCON0 = 0b00000101;   // ADON=1, canal AN1
-    ADCON1 = 13;           // AN0 y AN1 analogicos, resto digital
-    ADCON2 = 0b10001000;   // Justificado derecha, Tad=2*Tosc, Tacq=2 Tad
+    // -- Prioridades de interrupcion ------------------------------------------
+    IPEN = 1;
+    PEIE = 1;
+    GIE  = 1;
 
-    /* 3. Puertos */
-    TRISA = 0b00000010;    // RA1 entrada analogica; RA4, RA5 salidas (LCD)
-    LATA  = 0;
+    // -- ADC: AN1 (potenciometro). AN0 y AN1 analogicos, resto digital --------
+    ADCON0 = 0b00000101;
+    ADCON1 = 0x0D;
+    ADCON2 = 0b10001000;
 
-    TRISD = 0;             // PORTD salida (datos LCD)
+    // -- PORTA: RA0/RA1 entradas analogicas; RA2-RA6 salidas ------------------
+    TRISA  = 0b00000011;
+    LATA   = 0;
+    LATA2  = 1;
+
+    // -- PORTB: teclado matricial ---------------------------------------------
+    TRISB = 0b11110000;
+    LATB  = 0b00000000;
+    RBPU  = 0;
+
+    // -- PORTC: RC0 TRIGGER (out), RC1 ECHO (in), RC2 MOTOR (out), RC6/7 UART --
+    TRISC = 0b11000010;
+    LATC  = 0b00000000;
+    MOTOR = 0;
+    TRIGGER = 0;
+
+    // -- PORTD: BCD (D0-D3) + datos LCD (D4-D7) -------------------------------
+    TRISD = 0;
     LATD  = 0;
 
-    TRISC = 0;             // PORTC salidas por defecto...
-    TRISCbits.TRISC6 = 1;  // ...TX como entrada (lo maneja la EUSART)
-    TRISCbits.TRISC7 = 1;  // ...RX como entrada
-    TRISCbits.TRISC0 = 0;  // RC0 = salida -> base del transistor del motor
-    LATC  = 0;
-    LATCbits.LATC0 = 0;    // motor APAGADO al inicio
+    // -- PORTE: RGB LED (anodo comun, activo bajo) ----------------------------
+    TRISE = 0b1000;
+    LATE  = 0b1111;
 
-    /* 4. UART a 9600 bps (Fosc=1MHz, BRGH=1, BRG16=1, SPBRG=25) */
+    // -- Timer0: prescaler 1:8, 16 bits (LED 1 s + base de muestreo ADC) ------
+    TMR0    = tmr0_reload;
+    T0CON   = 0b00000010;
+    TMR0IF  = 0;
+    TMR0IE  = 1;
+    TMR0IP  = 1;
+    TMR0ON  = 1;
+
+    // -- Timer1: medicion del eco del HC-SR04 ---------------------------------
+    T1CON   = 0b10000000;   // RD16=1, reloj interno Fosc/4, prescaler 1:1, apagado
+
+    // -- HLVD: detectar caida a ~4 V ------------------------------------------
+    HLVDCON = 0b00001100;
+    HLVDEN  = 1;
+    while (!IRVST);
+    HLVDIF  = 0;
+    HLVDIE  = 1;
+    HLVDIP  = 1;
+
+    // -- UART 9600 bps --------------------------------------------------------
     TXSTA   = 0b00100100;
-    RCSTA   = 0b10000000;
+    RCSTA   = 0b10010000;   // SPEN=1, CREN=1 (recepcion habilitada)
     BAUDCON = 0b00001000;
     SPBRG   = 25;
+    RCIF    = 0;
+    RCIE    = 1;
+    RCIP    = 1;
 
-    /* 5. LCD */
+    INT0IF = 0;
+
+    // -- Interrupcion por cambio en PORTB (teclado) ---------------------------
+    __delay_ms(100);
+    RBIF = 0;
+    RBIE = 1;
+
+    // -- Inicializar LCD ------------------------------------------------------
     __delay_ms(1000);
     ConfiguraLCD(4);
     InicializaLCD();
+    ComandoLCD(0x0C);
 
-    /* ========================================================
-     * 6. MOSTRAR LA CAUSA DEL RESET
-     * ======================================================== */
+    // -- MOSTRAR CAUSA DEL RESET ----------------------------------------------
     DireccionaLCD(0x80);
-    MensajeLCD_Var("Causa del reset:");
+    MensajeLCD_Var((unsigned char *)"Causa del reset:");
     DireccionaLCD(0xC0);
-
-    // BOR = bit 0 de RCON. En un POR real el hardware lo pone en 0 (RCON=0x28).
-    // Tras un MCLR queda en 1 (RCON=0x31) porque lo re-armamos en software.
     if ((causaReset & 0b00000001) == 0) {
-        MensajeLCD_Var("Falla de energia");
+        MensajeLCD_Var((unsigned char *)"Falla de energia");
         TransmitirCadena("Reset: Falla de energia\r\n");
     } else {
-        MensajeLCD_Var("Reset de usuario");
+        MensajeLCD_Var((unsigned char *)"Reset de usuario");
         TransmitirCadena("Reset: Usuario (MCLR)\r\n");
     }
-
-    // Mantener el mensaje 3 segundos (delay confiable por bucle)
-    for (unsigned char i = 0; i < 30; i++) {
-        __delay_ms(100);
-    }
+    for (unsigned char i = 0; i < 20; i++) __delay_ms(100);
     BorraLCD();
     __delay_ms(5);
-
     TransmitirCadena("Sistema listo\r\n");
+    TransmitirCadena("Comandos: P/E/A/R\r\n");
 
-    /* ========================================================
-     * 7. BUCLE PRINCIPAL (muestreo a 1 Hz + control de motor)
-     * ======================================================== */
-    unsigned int resultadoADC;
+    // -- Bienvenida animada ---------------------------------------------------
+    CreaCaracter(0, fantasmaArriba);
+    CreaCaracter(1, fantasmaAbajo);
 
+    DireccionaLCD(0x80);
+    MensajeLCD_Var((unsigned char *)"Un dia mas "); DireccionaLCD(0x8B); EscribeLCD_c(0);
+    DireccionaLCD(0xC0);
+    MensajeLCD_Var((unsigned char *)"un dia menos"); DireccionaLCD(0xCD); EscribeLCD_c(1);
+    __delay_ms(800);
+
+    cuadro = 0;
+    for (paso = 0; paso < 16; paso++) {
+        DireccionaLCD(0x8B); EscribeLCD_c(cuadro);
+        DireccionaLCD(0xCD); EscribeLCD_c(cuadro ^ 1);
+        cuadro ^= 1;
+        if ((paso & 0x04) == 0) ComandoLCD(0x1C);
+        else                    ComandoLCD(0x18);
+        __delay_ms(300);
+    }
+
+    // =========================================================================
+    //  MENU OBJETIVO
+    // =========================================================================
+    MENU_OBJETIVO:
+    digitoBuf[0]    = 0xFF;
+    digitoBuf[1]    = 0xFF;
+    numDigitos      = 0;
+    cuentaObjetivo  = 0;
+    counter         = 0;
+    tens            = 0;
+    FinalizarConteo = 0;
+    ReiniciarConteo = 0;
+    TeclaLista      = 0;
+    initialized     = 0;
+    enConteo        = 0;
+    LATE            = 0b1111;
+    LATD            = 0;
+    estadoObjeto    = 0;
+
+    tiempoInactivo  = 0;
+    backlightOn     = 1;
+    LATA2           = 1;
+
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"Digite la cuenta");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"objetivo: __");
+
+    while (cuentaObjetivo == 0) {
+        if (enEmergencia) ManejaEmergencia();
+        MuestreaEnviaADC();                       // ADC 1 Hz: envia por serial + motor
+
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0;
+        }
+
+        if (TeclaLista) {
+            TeclaLista = 0;
+            unsigned char t = Tecla;
+
+            if (t == 10) {
+                if      (numDigitos == 1) valorTemporal = digitoBuf[0];
+                else if (numDigitos == 2) valorTemporal = digitoBuf[0] * 10 + digitoBuf[1];
+                else                      valorTemporal = 0;
+
+                if (valorTemporal >= 1 && valorTemporal <= 59) {
+                    cuentaObjetivo = valorTemporal;
+                    DireccionaLCD(0xCC); EscribeLCD_c('O'); EscribeLCD_c('K');
+                    __delay_ms(1000);
+                } else {
+                    DireccionaLCD(0xCA); EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('R');
+                    __delay_ms(1500);
+                    DireccionaLCD(0xCA); EscribeLCD_c('_'); EscribeLCD_c('_'); EscribeLCD_c(' ');
+                    numDigitos   = 0;
+                    digitoBuf[0] = 0xFF; digitoBuf[1] = 0xFF;
+                }
+            } else if (t == 12) {
+                if (numDigitos > 0) {
+                    numDigitos--;
+                    digitoBuf[numDigitos] = 0xFF;
+                    DireccionaLCD(0xC9 + numDigitos + 1); EscribeLCD_c('_');
+                }
+            } else if (t <= 9 && numDigitos < 2) {
+                digitoBuf[numDigitos] = t;
+                numDigitos++;
+                DireccionaLCD(0xC9 + numDigitos); EscribeLCD_c('0' + t);
+            }
+        }
+    }
+
+    // -- Pantalla de conteo ---------------------------------------------------
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"Piezas falt: __");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"Cuenta obj.: ");
+    if (cuentaObjetivo >= 10) {
+        EscribeLCD_c('0' + (cuentaObjetivo / 10));
+        EscribeLCD_c('0' + (cuentaObjetivo % 10));
+    } else {
+        EscribeLCD_c(' '); EscribeLCD_c('0' + cuentaObjetivo);
+    }
+
+    enConteo = 1;
+    unsigned char counterAnterior = 0xFF;
+
+    // =========================================================================
+    //  BUCLE PRINCIPAL DE CONTEO (ULTRASONIDO)
+    // =========================================================================
     while (1) {
-        resultadoADC = Conversion(1);          // Lee el potenciometro (AN1)
+        if (enEmergencia) ManejaEmergencia();
+        MuestreaEnviaADC();                       // ADC 1 Hz: envia por serial + motor
 
-        // --- LCD: valor del ADC ---
-        DireccionaLCD(0x80);
-        MensajeLCD_Var("Pot(RA1): ");
-        EscribeLCD_n16(resultadoADC, 4);
-
-        // --- Control del motor segun umbral de 2.5V ---
-        // 2.5V con ADC de 10 bits y Vref=5V  ->  (2.5/5)*1023 ~= 512
-        DireccionaLCD(0xC0);
-        if (resultadoADC > 511) {              // > 2.5V
-            LATCbits.LATC0 = 1;                // motor ENCENDIDO
-            MensajeLCD_Var("Motor: ON       ");
-            TransmitirCadena("ADC=");
-            TransmitirNumero(resultadoADC);
-            TransmitirCadena(" Motor=ON\r\n");
-        } else {                               // < 2.5V
-            LATCbits.LATC0 = 0;                // motor APAGADO
-            MensajeLCD_Var("Motor: OFF      ");
-            TransmitirCadena("ADC=");
-            TransmitirNumero(resultadoADC);
-            TransmitirCadena(" Motor=OFF\r\n");
+        if (tiempoInactivo >= MS_SUSPENSION) {
+            EntrarSuspension();
+            counterAnterior = 0xFF;
+        }
+        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0;
         }
 
-        while (!TXSTAbits.TRMT);                // espera fin de transmision UART
-
-        // Muestreo a 1 Hz: 1 segundo entre lecturas
-        for (unsigned char i = 0; i < 10; i++) {
-            __delay_ms(100);
+        if (FinalizarConteo) {
+            goto MENU_OBJETIVO;
         }
+
+        if (ReiniciarConteo) {
+            ReiniciarConteo = 0;
+            counter         = 0;
+            tens            = 0;
+            initialized     = 0;
+            estadoObjeto    = 0;
+            LATE            = 0b1111;
+            LATD            = 0;
+            counterAnterior = 0xFF;
+        }
+
+        // -- Logica de Conteo con HC-SR04 ------------------------------------
+        unsigned char dist = MedirDistancia();
+
+        if (dist >= 5 && dist <= 8) {
+            if (estadoObjeto == 0) {
+                estadoObjeto = 1;            // El objeto entro en el rango 5-8 cm
+                if (!initialized) {
+                    initialized = 1;
+                    LATE = 0b1010;
+                }
+            }
+        }
+        else if (dist > 8 && dist != 255) {
+            if (estadoObjeto == 1) {
+                estadoObjeto = 0;            // El objeto salio del rango -> cuenta
+                counter++;
+                tiempoInactivo = 0;
+                LATA2 = backlightOn;
+
+                if (counter >= 10) {
+                    counter = 0;
+                    tens++;
+                    setRGB();
+                }
+                LATD = counter & 0x0F;
+            }
+        }
+
+        if (counter != counterAnterior) {
+            counterAnterior = counter;
+            unsigned char totalContadas = (unsigned char)(tens * 10 + counter);
+            ActualizaLCD(cuentaObjetivo, totalContadas);
+            LATD = counter & 0x0F;
+        }
+
+        if (rangRang) {
+            buzz(0);
+            rangRang = 0; ringRing = 0;
+        } else if (ringRing) {
+            buzz(1);
+            ringRing = 0;
+        }
+
+        __delay_ms(40);
     }
 }
 
-/* ============================================================
- * FUNCIONES
- * ============================================================ */
+// =============================================================================
+//  FUNCION: Medir Distancia con HC-SR04 (con timeout anti-cuelgue)
+//  Devuelve cm, o 255 si no hay eco / fuera de rango.
+// =============================================================================
+unsigned char MedirDistancia(void) {
+    unsigned char aux = 0;
+    unsigned int  guard;
 
-/* --- ADC --- */
+    CCP2CON = 0b00000100;   // CCP2 captura por flanco de bajada (fin del eco en RC1)
+    TMR1   = 0;
+    CCP2IF = 0;
+    TMR1IF = 0;             // limpiar overflow previo
+
+    TRIGGER = 1;            // pulso de disparo
+    __delay_us(10);
+    TRIGGER = 0;
+
+    // Espera a que ECHO suba, con timeout (si el sensor no responde no se cuelga)
+    guard = 0;
+    while (ECHO == 0) {
+        if (++guard > 60000) return 255;
+    }
+
+    TMR1ON = 1;
+    while (CCP2IF == 0 && TMR1IF == 0);   // espera fin del eco o desborde
+    TMR1ON = 0;
+
+    if (TMR1IF == 1) {
+        aux = 255;
+        TMR1IF = 0;
+    } else {
+        if (CCPR2 >= 3556) CCPR2 = 3556;
+        aux = (unsigned char)(CCPR2 / 14);
+    }
+    return aux;
+}
+
+// =============================================================================
+//  Manejo de Emergencia, Comandos Seriales y Perifericos
+// =============================================================================
+void ManejaEmergencia(void) {
+    MOTOR  = 0; motorOn = 0;
+    LATE   = 0b1110;
+    LATA2  = 1; backlightOn = 1;
+
+    BorraLCD();
+    DireccionaLCD(0x80); MensajeLCD_Var((unsigned char *)"!! EMERGENCIA !!");
+    DireccionaLCD(0xC0); MensajeLCD_Var((unsigned char *)"Sistema detenido");
+
+    while (enEmergencia) {
+        // Bloqueado hasta Reset por MCLR
+    }
+}
+
+void ProcesaComando(unsigned char c) {
+    switch (c) {
+        case 'P': case 'p':
+            if (!enEmergencia) {
+                enEmergencia = 1; enConteo = 0; motorOn = 0; MOTOR = 0;
+                LATE = 0b1110;
+                TransmitirCadena("CMD P: EMERGENCY\r\n");
+            }
+            break;
+        case 'E': case 'e':
+            if (!enEmergencia) {
+                modoManual = 1; motorOn = 1; MOTOR = 1;
+                TransmitirCadena("CMD E: Motor ON\r\n");
+            }
+            break;
+        case 'A': case 'a':
+            if (!enEmergencia) {
+                modoManual = 1; motorOn = 0; MOTOR = 0;
+                TransmitirCadena("CMD A: Motor OFF\r\n");
+            }
+            break;
+        case 'R': case 'r':
+            if (enConteo && !enEmergencia) {
+                ReiniciarConteo = 1;
+                TransmitirCadena("CMD R: Reinicio conteo\r\n");
+            }
+            break;
+    }
+}
+
+void Transmitir(unsigned char dato) {
+    while (!PIR1bits.TXIF);
+    TXREG = dato;
+}
+
+void TransmitirCadena(const char *cad) {
+    while (*cad) Transmitir((unsigned char)*cad++);
+}
+
+// Envia un entero como texto ASCII (ej. 553 -> '5','5','3')
+void TransmitirNumero(unsigned int valor) {
+    char buffer[6];
+    signed char i = 0;
+    if (valor == 0) { Transmitir('0'); return; }
+    while (valor > 0) { buffer[i++] = (char)('0' + (valor % 10)); valor /= 10; }
+    while (i > 0) Transmitir((unsigned char)buffer[--i]);
+}
+
 unsigned int Conversion(unsigned char canal) {
-    ADCON0 = (ADCON0 & 0b11000011) | (canal << 2);
-    __delay_us(20);       // tiempo de adquisicion extra por seguridad
+    ADCON0 = (unsigned char)((ADCON0 & 0b11000011) | (canal << 2));
+    __delay_us(20);
     GO = 1;
     while (GO == 1);
     return ADRES;
 }
 
-/* --- UART --- */
-void Transmitir(unsigned char dato) {
-    while (!PIR1bits.TXIF);    // espera a que TXREG este vacio
-    TXREG = dato;
+// =============================================================================
+//  Muestreo del potenciometro a 1 Hz:
+//   - lee el ADC (AN1)
+//   - lo envia por serial en ASCII ("Valor del ADC: NNN")
+//   - controla el motor por umbral de 2.5V (ADC > 511), salvo override serial
+//  El disparo (flagADC) lo genera el Timer0 cada 1 segundo.
+// =============================================================================
+void MuestreaEnviaADC(void) {
+    if (!flagADC) return;
+    flagADC = 0;
+
+    unsigned int adc = Conversion(1);
+
+    TransmitirCadena("Valor del ADC: ");
+    TransmitirNumero(adc);
+    TransmitirCadena("\r\n");
+
+    if (!modoManual && !enEmergencia) {
+        if (adc > 511) { MOTOR = 1; motorOn = 1; }   // > 2.5V -> ON
+        else           { MOTOR = 0; motorOn = 0; }   // < 2.5V -> OFF
+    }
 }
 
-void TransmitirCadena(const char *cad) {
-    while (*cad) Transmitir(*cad++);
+void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
+    ComandoLCD((unsigned char)(0x40 | (pos << 3)));
+    for (unsigned char i = 0; i < 8; i++) EscribeLCD_c(mapa[i]);
+    DireccionaLCD(0x80);
 }
 
-/* Envia un entero como texto ASCII (ej. 1023 -> '1','0','2','3') */
-void TransmitirNumero(unsigned int valor) {
-    char buffer[6];
-    signed char i = 0;
-    if (valor == 0) { Transmitir('0'); return; }
-    while (valor > 0) { buffer[i++] = '0' + (valor % 10); valor /= 10; }
-    while (i > 0) Transmitir(buffer[--i]);
+void EntrarSuspension(void) {
+    LATA2 = 0; LATA6 = 0; LATE = 0b1111;
+    backlightOn  = 1;
+    enSuspension = 1;
+    RBIF = 0; RBIE = 1; GIE = 1;
+
+    asm("SLEEP");
+    asm("NOP");
+
+    enSuspension   = 0;
+    tiempoInactivo = 0;
+    LATA2          = 1;
+    backlightOn    = 1;
 }
 
+void ActualizaLCD(unsigned char objetivo, unsigned char contadas) {
+    unsigned char faltantes = (contadas >= objetivo) ? 0 : (unsigned char)(objetivo - contadas);
+    DireccionaLCD(0x8D);
+    if (faltantes >= 10) {
+        EscribeLCD_c((unsigned char)('0' + (faltantes / 10)));
+        EscribeLCD_c((unsigned char)('0' + (faltantes % 10)));
+    } else {
+        EscribeLCD_c(' '); EscribeLCD_c((unsigned char)('0' + faltantes));
+    }
+}
 
+void buzz(unsigned char shortBuzz) {
+    GIE   = 0;
+    LATA3 = 1;
+    if (shortBuzz) __delay_ms(80);
+    else           __delay_ms(1500);
+    LATA3 = 0;
+    GIE   = 1;
+}
 
+void setRGB(void) {
+    switch (tens) {
+        case 0: LATE = 0b1010; break;
+        case 1: LATE = 0b1011; ringRing = 1; break;
+        case 2: LATE = 0b1001; ringRing = 1; break;
+        case 3: LATE = 0b1101; ringRing = 1; break;
+        case 4: LATE = 0b1100; ringRing = 1; break;
+        case 5: LATE = 0b1000; ringRing = 1; break;
+        case 6: tens = 0; LATE = 0b1010; rangRang = 1; break;
+        default: LATE = 0b1111; break;
+    }
+}
 
+// =============================================================================
+//  ISR DE ALTA PRIORIDAD
+// =============================================================================
+void interrupt ISR(void) {
+    if (TMR0IF == 1) {
+        TMR0IF = 0;
+        TMR0   = tmr0_reload;
+        LATA6  = LATA6 ^ 1;     // LED que parpadea cada segundo (RA6)
+        if (tiempoInactivo < 60000) {
+            tiempoInactivo += (tmr0_reload == 57724) ? 250 : 1000;
+        }
+        // -- Base de tiempo para el muestreo del ADC a 1 Hz ------------------
+        acumADC += (tmr0_reload == 57724) ? 250 : 1000;
+        if (acumADC >= 1000) { acumADC = 0; flagADC = 1; }
+    }
 
+    if (HLVDIF == 1) {
+        HLVDIE = 0;
+        if (VDIRMAG == 0) { tmr0_reload = 57724; VDIRMAG = 1; }
+        else              { tmr0_reload = 34286; VDIRMAG = 0; }
+        while (!IRVST);
+        HLVDIF = 0; HLVDIE = 1;
+    }
 
+    if (PIR1bits.RCIF == 1) {
+        if (RCSTAbits.OERR) { RCSTAbits.CREN = 0; RCSTAbits.CREN = 1; }
+        unsigned char c = RCREG;
+        tiempoInactivo = 0;
+        if (LATA2 == 0 && !enSuspension) LATA2 = backlightOn;
+        ProcesaComando(c);
+    }
+
+    if (RBIF == 1) {
+        if (PORTB != 0b11110000) {
+            Tecla = 0;
+            LATB = 0b11111110;
+            if      (PORTBbits.RB4 == 0) Tecla = 13;
+            else if (PORTBbits.RB5 == 0) Tecla = 12;
+            else if (PORTBbits.RB6 == 0) Tecla = 11;
+            else if (PORTBbits.RB7 == 0) Tecla = 10;
+            else {
+                LATB = 0b11111101;
+                if      (PORTBbits.RB4 == 0) Tecla = 15;
+                else if (PORTBbits.RB5 == 0) Tecla = 9;
+                else if (PORTBbits.RB6 == 0) Tecla = 6;
+                else if (PORTBbits.RB7 == 0) Tecla = 3;
+                else {
+                    LATB = 0b11111011;
+                    if      (PORTBbits.RB4 == 0) Tecla = 0;
+                    else if (PORTBbits.RB5 == 0) Tecla = 8;
+                    else if (PORTBbits.RB6 == 0) Tecla = 5;
+                    else if (PORTBbits.RB7 == 0) Tecla = 2;
+                    else {
+                        LATB = 0b11110111;
+                        if      (PORTBbits.RB4 == 0) Tecla = 14;
+                        else if (PORTBbits.RB5 == 0) Tecla = 7;
+                        else if (PORTBbits.RB6 == 0) Tecla = 4;
+                        else if (PORTBbits.RB7 == 0) Tecla = 1;
+                    }
+                }
+            }
+            LATB = 0b00000000;
+            tiempoInactivo = 0;
+
+            if (enSuspension) { enSuspension = 0; }
+            else {
+                if (Tecla == 11) {
+                    if (!enEmergencia) { enEmergencia = 1; enConteo = 0; motorOn = 0; MOTOR = 0; LATE = 0b1110; }
+                }
+                else if (Tecla == 14) { ReiniciarConteo = 1; }
+                else if (Tecla == 15) { FinalizarConteo = 1; }
+                else if (Tecla == TECLA_BACKLIGHT) { backlightOn ^= 1; }
+                else { TeclaLista = 1; }
+                LATA2 = backlightOn;
+            }
+        }
+        __delay_ms(100);
+        RBIF = 0;
+    }
+}
