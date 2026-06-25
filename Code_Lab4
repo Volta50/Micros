@@ -150,7 +150,7 @@ void main(void) {
     unsigned char paso, cuadro = 0;     // BONUS: animacion de bienvenida
 
     // -- Oscilador interno 1 MHz - PRIMERO, antes de cualquier delay o IRQ ----
-    OSCCON = 0b01000011;
+    //OSCCON = 0b01000011;
     while (!OSCCONbits.IOFS);  // Esperar oscilador interno estable
 
     // -- Prioridades de interrupcion ------------------------------------------
@@ -172,7 +172,7 @@ void main(void) {
     // -- PORTB: teclado matricial ----------------------------------------------
     TRISB = 0b11110000;
     LATB  = 0b00000000;
-    RBPU  = 0;
+    RBPU  = 0; // Activa los pullups en el puerto B
 
     // -- PORTC: HC-SR04 (RC0 TRIGGER salida, RC1 ECHO entrada) -----------------
     TRISC = 0b00000010;
@@ -279,6 +279,9 @@ void main(void) {
     // =========================================================================
     //  MENU OBJETIVO
     // =========================================================================
+    initialized     = 0;
+    LATE            = 0b1111;
+    
     MENU_OBJETIVO:
 
     digitoBuf[0]    = 0xFF;
@@ -290,9 +293,7 @@ void main(void) {
     FinalizarConteo = 0;
     ReiniciarConteo = 0;
     TeclaLista      = 0;
-    initialized     = 0;
     estadoObjeto    = 0;
-    LATE            = 0b1111;
     LATD            = 0;
 
     // -- BONUS 2: arrancar la cuenta de inactividad AQUI (post-bienvenida) -----
@@ -412,9 +413,9 @@ void main(void) {
             ReiniciarConteo = 0;
             counter         = 0;
             tens            = 0;
-            initialized     = 0;
+            initialized     = 1;
             estadoObjeto    = 0;
-            LATE            = 0b1111;
+            LATE            = 0b1010;// Ya fue inicializado, solo falla de energia deja el led en negro
             LATD            = 0;
             counterAnterior = 0xFF;
         }
@@ -761,5 +762,9 @@ void interrupt ISR(void) {
         RBIF = 0;
     }
 }
+
+
+
+
 
 
