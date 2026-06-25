@@ -80,27 +80,27 @@
 #pragma config LVP    = OFF
 
 // -- Variables globales -------------------------------------------------------
-volatile unsigned char Tecla           = 0;
-volatile unsigned char TeclaLista      = 0;
-volatile unsigned char counter         = 0;
-volatile unsigned char tens            = 0;
+volatile unsigned char Tecla = 0;
+volatile unsigned char TeclaLista = 0;
+volatile unsigned char counter = 0;
+volatile unsigned char tens = 0;
 volatile unsigned char FinalizarConteo = 0;
 volatile unsigned char ReiniciarConteo = 0;
-volatile unsigned char ringRing        = 0;
-volatile unsigned char rangRang        = 0;
-volatile unsigned char initialized     = 0;
+volatile unsigned char ringRing = 0;
+volatile unsigned char rangRang = 0;
+volatile unsigned char initialized = 0;
 
-volatile unsigned int  tmr0_reload     = 34286;
+volatile unsigned int tmr0_reload = 34286;
 
 // -- BONUS 2: gestion de inactividad / suspension -----------------------------
-volatile unsigned int  tiempoInactivo  = 0;   // ms acumulados por Timer0
-volatile unsigned char backlightOn     = 1;   // estado DESEADO del BLK (RA2)
-volatile unsigned char enSuspension    = 0;   // 1 mientras el sistema duerme
+volatile unsigned int tiempoInactivo = 0; // ms acumulados por Timer0
+volatile unsigned char backlightOn = 1; // estado DESEADO del BLK (RA2)
+volatile unsigned char enSuspension = 0; // 1 mientras el sistema duerme
 
 // -- Estado de la deteccion del objeto (HC-SR04) ------------------------------
 //   0 = objeto NO presente en el rango (lejos o sin eco)
 //   1 = objeto presente en [DIST_MIN_CM, DIST_MAX_CM]
-volatile unsigned char estadoObjeto    = 0;
+volatile unsigned char estadoObjeto = 0;
 
 // =============================================================================
 //  BONUS: Caracteres propios en CGRAM - fantasma con 2 cuadros de animacion
@@ -108,26 +108,26 @@ volatile unsigned char estadoObjeto    = 0;
 
 // Fantasma 5x8 - cuadro 0: posicion ALTA (flotando arriba)
 const unsigned char fantasmaArriba[8] = {
-    0b01110,    //  ###   <- cupula de la cabeza
-    0b11111,    // #####
-    0b10101,    // # # #  <- ojos
-    0b11111,    // #####
-    0b11111,    // #####  <- cuerpo
-    0b11111,    // #####
-    0b10101,    // # # #  <- falda ondulada (picos en extremos)
-    0b00000     //        <- fila libre (espacio para "bajar")
+    0b01110, //  ###   <- cupula de la cabeza
+    0b11111, // #####
+    0b10101, // # # #  <- ojos
+    0b11111, // #####
+    0b11111, // #####  <- cuerpo
+    0b11111, // #####
+    0b10101, // # # #  <- falda ondulada (picos en extremos)
+    0b00000 //        <- fila libre (espacio para "bajar")
 };
 
 // Fantasma 5x8 - cuadro 1: posicion BAJA (bajado 1 pixel, falda alternada)
 const unsigned char fantasmaAbajo[8] = {
-    0b00000,    //        <- fila libre (el fantasma bajo)
-    0b01110,    //  ###
-    0b11111,    // #####
-    0b10101,    // # # #  <- ojos
-    0b11111,    // #####
-    0b11111,    // #####
-    0b11111,    // #####
-    0b01010     //  # #   <- falda ondulada (picos al centro = ondeo)
+    0b00000, //        <- fila libre (el fantasma bajo)
+    0b01110, //  ###
+    0b11111, // #####
+    0b10101, // # # #  <- ojos
+    0b11111, // #####
+    0b11111, // #####
+    0b11111, // #####
+    0b01010 //  # #   <- falda ondulada (picos al centro = ondeo)
 };
 
 // -- Prototipos ----------------------------------------------------------------
@@ -142,21 +142,22 @@ void interrupt ISR(void);
 // =============================================================================
 //  MAIN
 // =============================================================================
+
 void main(void) {
-    unsigned char digitoBuf[2]  = {0xFF, 0xFF};
-    unsigned char numDigitos     = 0;
+    unsigned char digitoBuf[2] = {0xFF, 0xFF};
+    unsigned char numDigitos = 0;
     unsigned char cuentaObjetivo = 0;
     unsigned char valorTemporal;
-    unsigned char paso, cuadro = 0;     // BONUS: animacion de bienvenida
+    unsigned char paso, cuadro = 0; // BONUS: animacion de bienvenida
 
     // -- Oscilador interno 1 MHz - PRIMERO, antes de cualquier delay o IRQ ----
     //OSCCON = 0b01000011;
-    while (!OSCCONbits.IOFS);  // Esperar oscilador interno estable
+    while (!OSCCONbits.IOFS); // Esperar oscilador interno estable
 
     // -- Prioridades de interrupcion ------------------------------------------
     IPEN = 1;
     PEIE = 1;
-    GIE  = 1;
+    GIE = 1;
 
     // -- Puertos analogicos -> digitales --------------------------------------
     //  Aqui no se usa ADC (a diferencia de la Guia 5), asi que dejamos todo
@@ -165,48 +166,48 @@ void main(void) {
     ADCON1 = 0x0F;
 
     // -- PORTA: RA0/RA1 entradas, RA2-RA6 salidas, RA7 sin usar ----------------
-    TRISA  = 0b00000011;
-    LATA   = 0;
-    LATA2  = 1; // Backlight encendido al arranque
+    TRISA = 0b00000011;
+    LATA = 0;
+    LATA2 = 1; // Backlight encendido al arranque
 
     // -- PORTB: teclado matricial ----------------------------------------------
     TRISB = 0b11110000;
-    LATB  = 0b00000000;
-    RBPU  = 0; // Activa los pullups en el puerto B
+    LATB = 0b00000000;
+    RBPU = 0; // Activa los pullups en el puerto B
 
     // -- PORTC: HC-SR04 (RC0 TRIGGER salida, RC1 ECHO entrada) -----------------
     TRISC = 0b00000010;
-    LATC  = 0b00000000;
+    LATC = 0b00000000;
     TRIGGER = 0;
 
     // -- PORTD: BCD (D0-D3) + datos LCD (D4-D7) --------------------------------
     TRISD = 0;
-    LATD  = 0;
+    LATD = 0;
 
     // -- PORTE: RGB LED (anodo comun, activo bajo) en RE0-RE2 ------------------
-    TRISE = 0b1000;     // RE3 entrada, RE2:RE0 salidas
-    LATE  = 0b1111;     // RGB apagado (todo en '1')
+    TRISE = 0b1000; // RE3 entrada, RE2:RE0 salidas
+    LATE = 0b1111; // RGB apagado (todo en '1')
 
     // -- Timer0: prescaler 1:8, 16 bits ----------------------------------------
-    TMR0    = tmr0_reload;
-    T0CON   = 0b00000010;
-    TMR0IF  = 0;
-    TMR0IE  = 1;
-    TMR0IP  = 1;
-    TMR0ON  = 1;
+    TMR0 = tmr0_reload;
+    T0CON = 0b00000010;
+    TMR0IF = 0;
+    TMR0IE = 1;
+    TMR0IP = 1;
+    TMR0ON = 1;
 
     // -- Timer1: medicion del eco del HC-SR04 ----------------------------------
     //  Sin prescaler -> ticks de Tcy = 4 us a Fosc = 1 MHz.
     //  Se enciende y apaga puntualmente dentro de MedirDistancia().
-    T1CON   = 0b10000000;
+    T1CON = 0b10000000;
 
     // -- HLVD: detectar caida a ~4 V -------------------------------------------
     HLVDCON = 0b00001100;
-    HLVDEN  = 1;
+    HLVDEN = 1;
     while (!IRVST);
-    HLVDIF  = 0;
-    HLVDIE  = 1;
-    HLVDIP  = 1;
+    HLVDIF = 0;
+    HLVDIE = 1;
+    HLVDIP = 1;
 
     // -- INT0: no usado ----------------------------------------------------------
     INT0IF = 0;
@@ -232,29 +233,43 @@ void main(void) {
     ComandoLCD(0x0C);
 
     // -- Cargar fantasma (2 cuadros de animacion) en CGRAM ------------------------
-    CreaCaracter(0, fantasmaArriba);   // caracter propio 0
-    CreaCaracter(1, fantasmaAbajo);    // caracter propio 1
+    CreaCaracter(0, fantasmaArriba); // caracter propio 0
+    CreaCaracter(1, fantasmaAbajo); // caracter propio 1
 
     // -- Mensaje de bienvenida + fantasmas ----------------------------------------
     // Linea 1: "Un dia mas" + fantasma en 0x8B
     DireccionaLCD(0x80);
-    EscribeLCD_c('U'); EscribeLCD_c('n'); EscribeLCD_c(' ');
-    EscribeLCD_c('d'); EscribeLCD_c('i'); EscribeLCD_c('a');
-    EscribeLCD_c(' '); EscribeLCD_c('m'); EscribeLCD_c('a');
+    EscribeLCD_c('U');
+    EscribeLCD_c('n');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('d');
+    EscribeLCD_c('i');
+    EscribeLCD_c('a');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('m');
+    EscribeLCD_c('a');
     EscribeLCD_c('s');
     DireccionaLCD(0x8B);
-    EscribeLCD_c(0);                 // fantasma (cuadro arriba)
+    EscribeLCD_c(0); // fantasma (cuadro arriba)
 
     // Linea 2: "un dia menos" + fantasma en 0xCD
     DireccionaLCD(0xC0);
-    EscribeLCD_c('u'); EscribeLCD_c('n'); EscribeLCD_c(' ');
-    EscribeLCD_c('d'); EscribeLCD_c('i'); EscribeLCD_c('a');
-    EscribeLCD_c(' '); EscribeLCD_c('m'); EscribeLCD_c('e');
-    EscribeLCD_c('n'); EscribeLCD_c('o'); EscribeLCD_c('s');
+    EscribeLCD_c('u');
+    EscribeLCD_c('n');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('d');
+    EscribeLCD_c('i');
+    EscribeLCD_c('a');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('m');
+    EscribeLCD_c('e');
+    EscribeLCD_c('n');
+    EscribeLCD_c('o');
+    EscribeLCD_c('s');
     DireccionaLCD(0xCD);
-    EscribeLCD_c(1);                 // fantasma (cuadro abajo)
+    EscribeLCD_c(1); // fantasma (cuadro abajo)
 
-    __delay_ms(800);                 // ver el mensaje quieto un momento
+    __delay_ms(800); // ver el mensaje quieto un momento
 
     // -- Animacion: desplazamiento D/I con fantasma flotando ----------------------
     cuadro = 0;
@@ -262,16 +277,16 @@ void main(void) {
 
         // Animar el fantasma (alterna arriba <-> abajo, en contrafase)
         DireccionaLCD(0x8B);
-        EscribeLCD_c(cuadro);            // 0 o 1
+        EscribeLCD_c(cuadro); // 0 o 1
         DireccionaLCD(0xCD);
-        EscribeLCD_c(cuadro ^ 1);        // el otro cuadro
+        EscribeLCD_c(cuadro ^ 1); // el otro cuadro
         cuadro ^= 1;
 
         // Desplazar la pantalla: 4 a la derecha, 4 a la izquierda, repetir.
         if ((paso & 0x04) == 0)
-            ComandoLCD(0x1C);            // desplaza pantalla a la DERECHA
+            ComandoLCD(0x1C); // desplaza pantalla a la DERECHA
         else
-            ComandoLCD(0x18);            // desplaza pantalla a la IZQUIERDA
+            ComandoLCD(0x18); // desplaza pantalla a la IZQUIERDA
 
         __delay_ms(300);
     }
@@ -279,40 +294,59 @@ void main(void) {
     // =========================================================================
     //  MENU OBJETIVO
     // =========================================================================
-    initialized     = 0;
-    LATE            = 0b1111;
-    
-    MENU_OBJETIVO:
 
-    digitoBuf[0]    = 0xFF;
-    digitoBuf[1]    = 0xFF;
-    numDigitos      = 0;
-    cuentaObjetivo  = 0;
-    counter         = 0;
-    tens            = 0;
+    LATE = 0b1111;
+
+MENU_OBJETIVO:
+
+    digitoBuf[0] = 0xFF;
+    digitoBuf[1] = 0xFF;
+    numDigitos = 0;
+    cuentaObjetivo = 0;
+    counter = 0;
+    tens = 0;
     FinalizarConteo = 0;
     ReiniciarConteo = 0;
-    TeclaLista      = 0;
-    estadoObjeto    = 0;
-    LATD            = 0;
+    TeclaLista = 0;
+    estadoObjeto = 0;
+    LATD = 0;
+    initialized = 0;
 
     // -- BONUS 2: arrancar la cuenta de inactividad AQUI (post-bienvenida) -----
-    tiempoInactivo  = 0;
-    backlightOn     = 1;
-    LATA2           = 1;     // luz encendida al entrar al menu
+    tiempoInactivo = 0;
+    backlightOn = 1;
+    LATA2 = 1; // luz encendida al entrar al menu
 
     BorraLCD();
-    EscribeLCD_c('D'); EscribeLCD_c('i'); EscribeLCD_c('g');
-    EscribeLCD_c('i'); EscribeLCD_c('t'); EscribeLCD_c('e');
-    EscribeLCD_c(' '); EscribeLCD_c('l'); EscribeLCD_c('a');
-    EscribeLCD_c(' '); EscribeLCD_c('c'); EscribeLCD_c('u');
-    EscribeLCD_c('e'); EscribeLCD_c('n'); EscribeLCD_c('t');
+    EscribeLCD_c('D');
+    EscribeLCD_c('i');
+    EscribeLCD_c('g');
+    EscribeLCD_c('i');
+    EscribeLCD_c('t');
+    EscribeLCD_c('e');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('l');
+    EscribeLCD_c('a');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('c');
+    EscribeLCD_c('u');
+    EscribeLCD_c('e');
+    EscribeLCD_c('n');
+    EscribeLCD_c('t');
     EscribeLCD_c('a');
     DireccionaLCD(0xC0);
-    EscribeLCD_c('o'); EscribeLCD_c('b'); EscribeLCD_c('j');
-    EscribeLCD_c('e'); EscribeLCD_c('t'); EscribeLCD_c('i');
-    EscribeLCD_c('v'); EscribeLCD_c('o'); EscribeLCD_c(':');
-    EscribeLCD_c(' '); EscribeLCD_c('_'); EscribeLCD_c('_');
+    EscribeLCD_c('o');
+    EscribeLCD_c('b');
+    EscribeLCD_c('j');
+    EscribeLCD_c('e');
+    EscribeLCD_c('t');
+    EscribeLCD_c('i');
+    EscribeLCD_c('v');
+    EscribeLCD_c('o');
+    EscribeLCD_c(':');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('_');
+    EscribeLCD_c('_');
 
     // -- Captura numero objetivo (1-59) -----------------------------------------
     while (cuentaObjetivo == 0) {
@@ -320,9 +354,8 @@ void main(void) {
         // -- Gestion de inactividad tambien en el menu objetivo -----------------
         if (tiempoInactivo >= MS_SUSPENSION) {
             EntrarSuspension();
-        }
-        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
-            LATA2 = 0;          // apaga backlight (auto), conserva backlightOn
+        } else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0; // apaga backlight (auto), conserva backlightOn
         }
 
         if (TeclaLista) {
@@ -330,22 +363,27 @@ void main(void) {
             unsigned char t = Tecla;
 
             if (t == 10) {
-                if      (numDigitos == 1) valorTemporal = digitoBuf[0];
+                if (numDigitos == 1) valorTemporal = digitoBuf[0];
                 else if (numDigitos == 2) valorTemporal = digitoBuf[0] * 10 + digitoBuf[1];
-                else                      valorTemporal = 0;
+                else valorTemporal = 0;
 
                 if (valorTemporal >= 1 && valorTemporal <= 59) {
                     cuentaObjetivo = valorTemporal;
                     DireccionaLCD(0xCC);
-                    EscribeLCD_c('O'); EscribeLCD_c('K');
+                    EscribeLCD_c('O');
+                    EscribeLCD_c('K');
                     __delay_ms(1000);
                 } else {
                     DireccionaLCD(0xCA);
-                    EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('R');
+                    EscribeLCD_c('E');
+                    EscribeLCD_c('R');
+                    EscribeLCD_c('R');
                     __delay_ms(1500);
                     DireccionaLCD(0xCA);
-                    EscribeLCD_c('_'); EscribeLCD_c('_'); EscribeLCD_c(' ');
-                    numDigitos   = 0;
+                    EscribeLCD_c('_');
+                    EscribeLCD_c('_');
+                    EscribeLCD_c(' ');
+                    numDigitos = 0;
                     digitoBuf[0] = 0xFF;
                     digitoBuf[1] = 0xFF;
                 }
@@ -371,17 +409,35 @@ void main(void) {
     BorraLCD();
 
     DireccionaLCD(0x80);
-    EscribeLCD_c('P'); EscribeLCD_c('i'); EscribeLCD_c('e');
-    EscribeLCD_c('z'); EscribeLCD_c('a'); EscribeLCD_c('s');
-    EscribeLCD_c(' '); EscribeLCD_c('f'); EscribeLCD_c('a');
-    EscribeLCD_c('l'); EscribeLCD_c('t'); EscribeLCD_c(':');
-    EscribeLCD_c(' '); EscribeLCD_c('_'); EscribeLCD_c('_');
+    EscribeLCD_c('P');
+    EscribeLCD_c('i');
+    EscribeLCD_c('e');
+    EscribeLCD_c('z');
+    EscribeLCD_c('a');
+    EscribeLCD_c('s');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('f');
+    EscribeLCD_c('a');
+    EscribeLCD_c('l');
+    EscribeLCD_c('t');
+    EscribeLCD_c(':');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('_');
+    EscribeLCD_c('_');
 
     DireccionaLCD(0xC0);
-    EscribeLCD_c('C'); EscribeLCD_c('u'); EscribeLCD_c('e');
-    EscribeLCD_c('n'); EscribeLCD_c('t'); EscribeLCD_c('a');
-    EscribeLCD_c(' '); EscribeLCD_c('o'); EscribeLCD_c('b');
-    EscribeLCD_c('j'); EscribeLCD_c('.'); EscribeLCD_c(':');
+    EscribeLCD_c('C');
+    EscribeLCD_c('u');
+    EscribeLCD_c('e');
+    EscribeLCD_c('n');
+    EscribeLCD_c('t');
+    EscribeLCD_c('a');
+    EscribeLCD_c(' ');
+    EscribeLCD_c('o');
+    EscribeLCD_c('b');
+    EscribeLCD_c('j');
+    EscribeLCD_c('.');
+    EscribeLCD_c(':');
     EscribeLCD_c(' ');
     if (cuentaObjetivo >= 10) {
         EscribeLCD_c('0' + (cuentaObjetivo / 10));
@@ -399,24 +455,25 @@ void main(void) {
         // -- Gestion de inactividad en el conteo -------------------------------
         if (tiempoInactivo >= MS_SUSPENSION) {
             EntrarSuspension();
-            counterAnterior = 0xFF;     // forzar refresco del numero al volver
-        }
-        else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
-            LATA2 = 0;          // apaga backlight (auto), conserva backlightOn
+            counterAnterior = 0xFF; // forzar refresco del numero al volver
+        } else if (tiempoInactivo >= MS_APAGA_LUZ && LATA2 == 1) {
+            LATA2 = 0; // apaga backlight (auto), conserva backlightOn
         }
 
         if (FinalizarConteo) {
+            if (initialized)
+                LATE = 0b1010; //Lo pone en magenta puesto que ya fue inicializado
             goto MENU_OBJETIVO;
         }
 
         if (ReiniciarConteo) {
             ReiniciarConteo = 0;
-            counter         = 0;
-            tens            = 0;
-            initialized     = 1;
-            estadoObjeto    = 0;
-            LATE            = 0b1010;// Ya fue inicializado, solo falla de energia deja el led en negro
-            LATD            = 0;
+            counter = 0;
+            tens = 0;
+            initialized = 1;
+            estadoObjeto = 0;
+            LATE = 0b1010; // Ya fue inicializado, solo falla de energia deja el led en negro
+            LATD = 0;
             counterAnterior = 0xFF;
         }
 
@@ -432,19 +489,18 @@ void main(void) {
                 estadoObjeto = 1;
                 if (!initialized) {
                     initialized = 1;
-                    LATE = 0b1010;  // Magenta: primera pieza detectada
+                    LATE = 0b1010; // Magenta: primera pieza detectada
                 }
             }
-        }
-        else if (dist > DIST_MAX_CM && dist != 255) {
+        } else if (dist > DIST_MAX_CM && dist != 255) {
             if (estadoObjeto == 1) {
                 estadoObjeto = 0;
 
                 counter++;
 
                 // Una pieza es actividad
-                tiempoInactivo = 0;     // reinicia el temporizador de inactividad
-                LATA2 = backlightOn;    // restaura la luz si el auto-off la apago
+                tiempoInactivo = 0; // reinicia el temporizador de inactividad
+                LATA2 = backlightOn; // restaura la luz si el auto-off la apago
 
                 // setRGB() maneja internamente el reset de tens (case 6)
                 // y la activacion de rangRang, igual que el original.
@@ -460,7 +516,7 @@ void main(void) {
 
         if (counter != counterAnterior) {
             counterAnterior = counter;
-            unsigned char totalContadas = (unsigned char)(tens * 10 + counter);
+            unsigned char totalContadas = (unsigned char) (tens * 10 + counter);
             ActualizaLCD(cuentaObjetivo, totalContadas);
             LATD = counter & 0x0F;
         }
@@ -474,7 +530,7 @@ void main(void) {
             ringRing = 0;
         }
 
-        __delay_ms(20);     // muestreo del ultrasonido cada ~20+ ms
+        __delay_ms(20); // muestreo del ultrasonido cada ~20+ ms
     }
 }
 
@@ -489,17 +545,18 @@ void main(void) {
 //    el byte de retorno).
 //  - 'guard' protege contra cuelgues si el sensor no esta conectado.
 // =============================================================================
+
 unsigned char MedirDistancia(void) {
     unsigned char aux = 0;
-    unsigned int  guard;
+    unsigned int guard;
 
-    CCP2CON = 0b00000100;   // CCP2 captura por flanco de bajada
-    TMR1   = 0;
+    CCP2CON = 0b00000100; // CCP2 captura por flanco de bajada
+    TMR1 = 0;
     CCP2IF = 0;
     TMR1IF = 0;
 
     TRIGGER = 1;
-    __delay_us(20);          // pulso de disparo
+    __delay_us(20); // pulso de disparo
     TRIGGER = 0;
 
     // Espera al flanco de subida del ECHO (con timeout corto anti-cuelgue)
@@ -514,11 +571,11 @@ unsigned char MedirDistancia(void) {
     TMR1ON = 0;
 
     if (TMR1IF == 1) {
-        aux = 255;          // overflow de Timer1: muy lejos / sin eco valido
+        aux = 255; // overflow de Timer1: muy lejos / sin eco valido
         TMR1IF = 0;
     } else {
-        if (CCPR2 >= 3556) CCPR2 = 3556;   // clamp a ~254 cm
-        aux = (unsigned char)(CCPR2 / 14);
+        if (CCPR2 >= 3556) CCPR2 = 3556; // clamp a ~254 cm
+        aux = (unsigned char) (CCPR2 / 14);
     }
     return aux;
 }
@@ -531,13 +588,14 @@ unsigned char MedirDistancia(void) {
 //  lo que se escriba seguiria yendo a la CGRAM).
 //  El caracter queda disponible escribiendo EscribeLCD_c(pos).
 // =============================================================================
+
 void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
     unsigned char i;
-    ComandoLCD(0x40 | (unsigned char)(pos << 3));   // Set CGRAM address
+    ComandoLCD(0x40 | (unsigned char) (pos << 3)); // Set CGRAM address
     for (i = 0; i < 8; i++) {
-        EscribeLCD_c(mapa[i]);                      // RS=1: escribe el patron
+        EscribeLCD_c(mapa[i]); // RS=1: escribe el patron
     }
-    DireccionaLCD(0x80);                            // Volver a DDRAM
+    DireccionaLCD(0x80); // Volver a DDRAM
 }
 
 // =============================================================================
@@ -551,32 +609,34 @@ void CreaCaracter(unsigned char pos, const unsigned char *mapa) {
 //  despertaria el sistema. Si solo quieres que el teclado despierte, pon
 //  HLVDIE = 0 antes del SLEEP y restauralo despues.
 // =============================================================================
+
 void EntrarSuspension(void) {
     // Apagar lo que consume / es visible
-    LATA2 = 0;          // Backlight OFF
-    LATA6 = 0;          // LED indicador OFF (antes RA0)
-    LATE  = 0b1111;     // RGB OFF
+    LATA2 = 0; // Backlight OFF
+    LATA6 = 0; // LED indicador OFF (antes RA0)
+    LATE = 0b1111; // RGB OFF
 
     // Preparar el despertar por teclado
-    backlightOn  = 1;   // al volver queremos luz
+    backlightOn = 1; // al volver queremos luz
     enSuspension = 1;
     RBIF = 0;
     RBIE = 1;
-    GIE  = 1;
+    GIE = 1;
 
-    asm("SLEEP");       // <<< el PIC se duerme aqui
-    asm("NOP");         // se ejecuta al despertar (recomendado tras SLEEP)
+    asm("SLEEP"); // <<< el PIC se duerme aqui
+    asm("NOP"); // se ejecuta al despertar (recomendado tras SLEEP)
 
     // ---- Continua aqui tras despertar (la ISR de RBIF ya corrio) ----
-    enSuspension   = 0;
+    enSuspension = 0;
     tiempoInactivo = 0;
-    LATA2          = 1;   // Backlight ON
-    backlightOn    = 1;
+    LATA2 = 1; // Backlight ON
+    backlightOn = 1;
 }
 
 // =============================================================================
 //  Actualiza digitos de "Piezas falt:" en el LCD
 // =============================================================================
+
 void ActualizaLCD(unsigned char objetivo, unsigned char contadas) {
     unsigned char faltantes;
     faltantes = (contadas >= objetivo) ? 0 : (objetivo - contadas);
@@ -598,8 +658,9 @@ void ActualizaLCD(unsigned char objetivo, unsigned char contadas) {
 //  __delay_ms() en XC8 NO es interrupt-safe: se desactiva GIE durante el
 //  delay y se restaura al salir.
 // =============================================================================
+
 void buzz(unsigned char shortBuzz) {
-    GIE   = 0;          // Deshabilitar interrupciones durante el delay
+    GIE = 0; // Deshabilitar interrupciones durante el delay
     LATA3 = 1;
     if (shortBuzz) {
         __delay_ms(80);
@@ -607,7 +668,7 @@ void buzz(unsigned char shortBuzz) {
         __delay_ms(1500);
     }
     LATA3 = 0;
-    GIE   = 1;          // Restaurar interrupciones
+    GIE = 1; // Restaurar interrupciones
 }
 
 // =============================================================================
@@ -615,20 +676,33 @@ void buzz(unsigned char shortBuzz) {
 //  RE3=1 siempre | RE2=Azul | RE1=Verde | RE0=Rojo
 //  El case 6 resetea tens=0, pone Magenta y activa rangRang.
 // =============================================================================
+
 void setRGB(void) {
     switch (tens) {
-        case 0: LATE = 0b1111; break;                 // Apagado
-        case 1: LATE = 0b1011; ringRing = 1; break;   // Azul     (B)
-        case 2: LATE = 0b1001; ringRing = 1; break;   // Cyan     (G+B)
-        case 3: LATE = 0b1101; ringRing = 1; break;   // Verde    (G)
-        case 4: LATE = 0b1100; ringRing = 1; break;   // Amarillo (R+G)
-        case 5: LATE = 0b1000; ringRing = 1; break;   // Blanco   (R+G+B)
-        case 6:                                       // 60 piezas: resetear ciclo
-            tens     = 0;
-            LATE     = 0b1010;                        // Magenta  (R+B)
-            rangRang = 1;                             // Buzzer largo
+        case 0: LATE = 0b1111;
+            break; // Apagado
+        case 1: LATE = 0b1011;
+            ringRing = 1;
+            break; // Azul     (B)
+        case 2: LATE = 0b1001;
+            ringRing = 1;
+            break; // Cyan     (G+B)
+        case 3: LATE = 0b1101;
+            ringRing = 1;
+            break; // Verde    (G)
+        case 4: LATE = 0b1100;
+            ringRing = 1;
+            break; // Amarillo (R+G)
+        case 5: LATE = 0b1000;
+            ringRing = 1;
+            break; // Blanco   (R+G+B)
+        case 6: // 60 piezas: resetear ciclo
+            tens = 0;
+            LATE = 0b1010; // Magenta  (R+B)
+            rangRang = 1; // Buzzer largo
             break;
-        default: LATE = 0b1111; break;                // Apagado (seguridad)
+        default: LATE = 0b1111;
+            break; // Apagado (seguridad)
     }
 }
 
@@ -638,13 +712,14 @@ void setRGB(void) {
 //  - HLVD:    deteccion de voltaje bajo -> ajusta Timer0
 //  - RBIF:    teclado matricial (emergencia, reinicio, menu, backlight, wake)
 // =============================================================================
+
 void interrupt ISR(void) {
 
     // -- Timer0: conmutacion LED RA6 + cuenta de inactividad ------------------
     if (TMR0IF == 1) {
         TMR0IF = 0;
-        TMR0   = tmr0_reload;
-        LATA6  = LATA6 ^ 1;     // LED indicador conmuta en RA6 (antes RA0)
+        TMR0 = tmr0_reload;
+        LATA6 = LATA6 ^ 1; // LED indicador conmuta en RA6 (antes RA0)
 
         // -- Acumular tiempo de inactividad ----------------------------------
         //  El reload define el periodo del desbordamiento: 1000 ms en normal,
@@ -658,11 +733,11 @@ void interrupt ISR(void) {
     if (HLVDIF == 1) {
         HLVDIE = 0;
         if (VDIRMAG == 0) {
-            tmr0_reload = 57724;    // 250 ms -> parpadeo rapido de alerta
-            VDIRMAG     = 1;
+            tmr0_reload = 57724; // 250 ms -> parpadeo rapido de alerta
+            VDIRMAG = 1;
         } else {
-            tmr0_reload = 34286;    // 1 s -> normal
-            VDIRMAG     = 0;
+            tmr0_reload = 34286; // 1 s -> normal
+            VDIRMAG = 0;
         }
         while (!IRVST);
         HLVDIF = 0;
@@ -675,33 +750,33 @@ void interrupt ISR(void) {
 
             // -- Barrido de las 4 columnas -------------------------------------
             Tecla = 0;
-            LATB = 0b11111110;                          // Columna 1
-            if      (PORTBbits.RB4 == 0) Tecla = 13;
+            LATB = 0b11111110; // Columna 1
+            if (PORTBbits.RB4 == 0) Tecla = 13;
             else if (PORTBbits.RB5 == 0) Tecla = 12;
             else if (PORTBbits.RB6 == 0) Tecla = 11;
             else if (PORTBbits.RB7 == 0) Tecla = 10;
             else {
-                LATB = 0b11111101;                      // Columna 2
-                if      (PORTBbits.RB4 == 0) Tecla = 15;
+                LATB = 0b11111101; // Columna 2
+                if (PORTBbits.RB4 == 0) Tecla = 15;
                 else if (PORTBbits.RB5 == 0) Tecla = 9;
                 else if (PORTBbits.RB6 == 0) Tecla = 6;
                 else if (PORTBbits.RB7 == 0) Tecla = 3;
                 else {
-                    LATB = 0b11111011;                  // Columna 3
-                    if      (PORTBbits.RB4 == 0) Tecla = 0;
+                    LATB = 0b11111011; // Columna 3
+                    if (PORTBbits.RB4 == 0) Tecla = 0;
                     else if (PORTBbits.RB5 == 0) Tecla = 8;
                     else if (PORTBbits.RB6 == 0) Tecla = 5;
                     else if (PORTBbits.RB7 == 0) Tecla = 2;
                     else {
-                        LATB = 0b11110111;              // Columna 4
-                        if      (PORTBbits.RB4 == 0) Tecla = 14;
+                        LATB = 0b11110111; // Columna 4
+                        if (PORTBbits.RB4 == 0) Tecla = 14;
                         else if (PORTBbits.RB5 == 0) Tecla = 7;
                         else if (PORTBbits.RB6 == 0) Tecla = 4;
                         else if (PORTBbits.RB7 == 0) Tecla = 1;
                     }
                 }
             }
-            LATB = 0b00000000;                          // Restaurar columnas
+            LATB = 0b00000000; // Restaurar columnas
 
             // -- Cualquier tecla = actividad ----------------------------------
             tiempoInactivo = 0;
@@ -715,39 +790,57 @@ void interrupt ISR(void) {
 
                 // -- Tecla 11: parada de emergencia ----------------------------
                 if (Tecla == 11) {
-                    LATE = 0b1110;      // Rojo (RE0=0 enciende rojo)
+                    LATE = 0b1110; // Rojo (RE0=0 enciende rojo)
 
                     BorraLCD();
                     DireccionaLCD(0x80);
-                    EscribeLCD_c('!'); EscribeLCD_c('!');
-                    EscribeLCD_c(' '); EscribeLCD_c('E'); EscribeLCD_c('M');
-                    EscribeLCD_c('E'); EscribeLCD_c('R'); EscribeLCD_c('G');
-                    EscribeLCD_c('E'); EscribeLCD_c('N'); EscribeLCD_c('C');
-                    EscribeLCD_c('I'); EscribeLCD_c('A'); EscribeLCD_c(' ');
-                    EscribeLCD_c('!'); EscribeLCD_c('!');
+                    EscribeLCD_c('!');
+                    EscribeLCD_c('!');
+                    EscribeLCD_c(' ');
+                    EscribeLCD_c('E');
+                    EscribeLCD_c('M');
+                    EscribeLCD_c('E');
+                    EscribeLCD_c('R');
+                    EscribeLCD_c('G');
+                    EscribeLCD_c('E');
+                    EscribeLCD_c('N');
+                    EscribeLCD_c('C');
+                    EscribeLCD_c('I');
+                    EscribeLCD_c('A');
+                    EscribeLCD_c(' ');
+                    EscribeLCD_c('!');
+                    EscribeLCD_c('!');
                     DireccionaLCD(0xC0);
-                    EscribeLCD_c('S'); EscribeLCD_c('i'); EscribeLCD_c('s');
-                    EscribeLCD_c('t'); EscribeLCD_c('e'); EscribeLCD_c('m');
-                    EscribeLCD_c('a'); EscribeLCD_c(' '); EscribeLCD_c('d');
-                    EscribeLCD_c('e'); EscribeLCD_c('t'); EscribeLCD_c('e');
-                    EscribeLCD_c('n'); EscribeLCD_c('i'); EscribeLCD_c('d');
+                    EscribeLCD_c('S');
+                    EscribeLCD_c('i');
+                    EscribeLCD_c('s');
+                    EscribeLCD_c('t');
+                    EscribeLCD_c('e');
+                    EscribeLCD_c('m');
+                    EscribeLCD_c('a');
+                    EscribeLCD_c(' ');
+                    EscribeLCD_c('d');
+                    EscribeLCD_c('e');
+                    EscribeLCD_c('t');
+                    EscribeLCD_c('e');
+                    EscribeLCD_c('n');
+                    EscribeLCD_c('i');
+                    EscribeLCD_c('d');
                     EscribeLCD_c('o');
-                    while (1) { }       // Bloqueo total: solo sale con MCLR
+                    while (1) {
+                    } // Bloqueo total: solo sale con MCLR
                 }
 
                 // -- Tecla 14: reiniciar conteo -------------------------------
                 if (Tecla == 14) {
                     ReiniciarConteo = 1;
-                }
-                // -- Tecla 15: volver al menu ---------------------------------
+                }// -- Tecla 15: volver al menu ---------------------------------
                 else if (Tecla == 15) {
                     FinalizarConteo = 1;
-                }
-                // -- Tecla de backlight: conmuta el estado deseado ------------
+                }// -- Tecla de backlight: conmuta el estado deseado ------------
                 else if (Tecla == TECLA_BACKLIGHT) {
                     backlightOn ^= 1;
-                }
-                // -- Resto de teclas ------------------------------------------
+                }// -- Resto de teclas ------------------------------------------
                 else {
                     TeclaLista = 1;
                 }
